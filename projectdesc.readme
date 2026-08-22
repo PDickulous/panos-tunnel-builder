@@ -1,0 +1,189 @@
+# PAN-OS Tunnel Builder
+
+PAN-OS Tunnel Builder creates and migrates route-based IPsec VPNs on Palo Alto
+Networks firewalls managed by Panorama. The operator selects a spoke firewall
+and a hub firewall by hostname or serial number. The tool discovers their
+assigned template stacks, shows which templates contain network configuration,
+recommends an eligible template for each endpoint, and confirms the selections
+before building configuration.
+
+## LSVPN replacement workflow
+
+When the spoke has GlobalProtect Large Scale VPN (LSVPN) satellite
+configuration, the tool discovers the effective hub and spoke configuration and
+builds an equivalent standard IPsec replacement plan. Satellite enrollment may
+be authorized by username or group, so a spoke serial number is not required in
+the hub portal configuration. Hub gateways are matched by configured name or by
+endpoint identity, including IPv4, IPv6, and publicly resolvable FQDN values.
+
+Each replacement consists of paired hub and spoke objects for:
+
+- IKEv2 and IPsec crypto profiles with moderate interoperability-oriented
+  cryptography.
+- IKE gateways and route-based auto-key IPsec tunnels.
+- IKE local endpoints validated against effective-running interface addresses.
+  The generated gateway uses the raw configured template reference—including a
+  Panorama variable such as `$eth2-IP`—and the unique interface that owns its
+  resolved effective address.
+- A cryptographically random pre-shared key generated independently for each
+  replacement tunnel.
+- Unique numbered `tunnel.N` interfaces on both endpoints.
+- Unique IPv4 `/30` or IPv6 `/127` interface addresses allocated from an
+  operator-supplied pool without overlapping existing interface networks. The
+  build command prompts for this pool when `--tunnel-address-pool` is omitted.
+- Matching routing-instance and zone membership, static routes, and tunnel
+  monitoring behavior.
+
+## Shared spoke templates
+
+The template that actually owns the LSVPN satellite is treated as the shared
+configuration boundary, independently of the interface-bearing template the
+operator initially selects. The tool discovers every template stack that
+contains the owner and every managed firewall assigned through those stacks.
+All inheriting spokes are migrated as one batch; deleting the shared satellite
+for only one firewall is not permitted. Satellite objects owned by multiple
+templates must be migrated as separate groups.
+
+The batch must be structurally compatible: satellite names, old and replacement
+tunnel-interface layout, vsys, zone, virtual/logical router and VRF, and the
+BGP/OSPF/static-routing topology must match. Value differences are represented
+with variables. Structural differences stop the migration and identify the
+firewall that needs a separate template or migration group.
+
+One reusable IKE gateway and IPsec tunnel are created in the shared LSVPN
+template. Tunnel-interface, routing, zone, and import changes are written once
+per distinct source-owning network-template placement, so stacks that share the
+LSVPN template but use different network templates are handled independently.
+Generated device-specific IP fields,
+IKE identities, route destinations, and PSKs use deterministic Panorama
+variables with per-device template-stack overrides. The hub retains a unique
+endpoint and unique variables for every spoke. Hub endpoint names contain the
+sanitized hub and spoke hostnames followed by a deterministic three-digit
+collision suffix, for example `labPAN3-to-labPAN1-638`; the matching IKE gateway
+adds `-ike`. A shared spoke template cannot vary an entry name per device, so
+its common object identifies the hub and `shared-spokes` instead of falsely
+naming one member. Variable names spell out their role, such as
+`$ptb-spoke-tunnel-interface-address-<id>` and
+`$ptb-hub-ike-pre-shared-key-<id>`. One random PSK is generated per spoke and
+assigned to both its spoke override and matching hub variable. Non-secret
+SHA-256 pairing fingerprints are stored as companion
+variables for auditability, and deterministic ownership-marker variables
+distinguish tool-managed variable sets from unrelated variables with colliding
+names. Because Panorama does not expose PSK plaintext for comparison, every
+rerun rotates each PSK and writes its spoke and hub values together in the same
+candidate transaction.
+
+Candidate loading is all-or-nothing. Variables and their overrides are written
+inside the same candidate transaction as the replacement objects. A write or
+post-write verification failure issues Panorama's candidate rollback and local
+pre-route artifacts from that failed attempt are removed. A successful rerun
+rotates paired PSK variables; a failed run leaves no variable or PSK state for
+the next attempt. If no LSVPN satellite configuration remains, a load request
+is treated as a successful no-op.
+
+The migration preserves dynamic routing when it is detected on the LSVPN path.
+This includes legacy virtual routers and advanced-routing logical-router VRFs,
+BGP and OSPFv2, BGP peer-group policy and filtering references, and OSPF
+interface attributes. Supported topologies include:
+
+- BGP bound directly to the LSVPN tunnel interface.
+- OSPF on the tunnel providing reachability between loopback addresses while a
+  multihop BGP session carries production routes. This behavior is used only
+  when reciprocal loopback peers are detected; direct tunnel-bound BGP takes
+  precedence.
+- BGP routing policy that advertises loopback prefixes, including link-local
+  addresses such as `169.254.65.x`, over a tunnel-bound BGP session.
+
+If reciprocal loopback BGP peers are present without OSPF on the LSVPN tunnel,
+the tool preserves the existing loopback-sourced BGP sessions and creates
+reciprocal `/32` or `/128` static host routes to the peer addresses through the
+new tunnel interfaces. This replaces loopback reachability that LSVPN had been
+installing implicitly without rebinding BGP and changing its source address.
+Existing per-spoke static routes with the same destination and the old LSVPN
+interface are removed on both endpoints; shared hub LSVPN tunnel and gateway
+configuration remains intact. Unrelated routes through the old interface still
+block candidate loading.
+Candidate loading is blocked only when a peer address cannot be resolved to an
+IP host route.
+
+## Route validation
+
+The route table and effective routing configuration must be captured before and
+after a migration on every affected hub and spoke firewall. Snapshots include
+all discovered legacy virtual routers
+and advanced-routing logical-router VRFs, IPv4 and IPv6 routes, protocol,
+administrative distance, metric, selected and installed state, and ECMP
+next-hop/interface paths, plus the virtual-router and logical-router
+configuration sections. Volatile values such as route uptime are omitted.
+
+Post-change validation reports missing, added, and changed routes and fails when
+the normalized tables do not match. Explicit prefix, tunnel-interface, and
+next-hop mappings account for the expected replacement link changes without
+hiding unrelated routing drift. Post-change validation should occur only after
+BGP and OSPF have converged. A candidate load writes a non-secret migration
+validation manifest beside the baseline snapshots. In a later tool run,
+`panos-tunnel-builder routes verify-migration MANIFEST` captures both endpoints
+again and applies only the tunnel-specific mappings recorded in that manifest.
+New connected/local routes for the replacement link and temporary additional
+equal-prefix candidates are tolerated, while unrelated route additions or loss
+still fail validation. The verifier also removes only the exact planned old/new
+interface references and replaced static-route names from its configuration
+comparison; any other routing-configuration change fails validation.
+
+## Greenfield workflow
+
+When no existing VPN is present, the intended workflow is to locate interfaces
+in external, untrust, or internet zones and create tunnels between those
+interfaces and the selected hub. If multiple eligible external interfaces are
+present, the tool creates a corresponding redundant tunnel for each one.
+
+## Panorama placement and safety
+
+Generated network objects belong in the Panorama templates that own each
+firewall's network configuration. The tool preserves the order of templates in
+the assigned stack, identifies templates containing eligible interface
+configuration, and allows the operator to override the recommended selection.
+
+The default workflow performs Panorama discovery and generates a local preview.
+With the explicit `--load-candidate` option, the tool acquires a temporary
+Panorama configuration lock and first verifies that candidate configuration
+matches running configuration. A dirty candidate is rejected by default because
+the failure rollback is global. The explicit `--allow-dirty-candidate` option
+bypasses that protection with a warning. A clean-candidate run saves a
+timestamped `LSVPN_PRE_<id>_<timestamp>.xml` Panorama snapshot; an explicitly
+allowed dirty-candidate run labels it `LSVPN_CHK_<id>_<timestamp>.xml` to make
+clear that it is a checkpoint containing pre-existing pending changes (both
+names fit PAN-OS's 32-character saved-config limit). The tool saves hub and
+spoke route snapshots locally, and loads the replacement into candidate
+configuration. It creates the new hub and spoke objects in the templates that
+own the corresponding source configuration, removes the spoke satellite
+tunnel and its obsolete interface/routing bindings, and leaves all hub LSVPN
+configuration intact. Before removing the old spoke interface, it audits every
+template in the spoke stack and blocks on any interface dependency the migration
+does not explicitly understand. After writing, it rereads candidate
+configuration to verify the replacement object trees, confirm every intended
+spoke cleanup, and prove that the hub LSVPN configuration fingerprint is
+unchanged. Unrelated name and variable-type collisions are rejected. Reruns
+update objects and variables carrying the tool's ownership markers and rotate
+both ends of every PSK pair.
+
+PAN-OS interface imports under `vsys/import/network/interface` are migrated as
+part of that workflow. Each replacement tunnel interface is imported into the
+same endpoint vsys in the source-owning template, and the obsolete spoke tunnel
+import is removed with the old satellite interface.
+
+The tool does not commit Panorama, push template stacks, or commit managed
+firewalls. The operator performs those steps separately, captures post-change
+routes after convergence, and runs the manifest-based verifier. The named
+Panorama snapshot can be loaded back into candidate configuration with the
+separate restore command; committing and pushing that rollback remains an
+operator-controlled action.
+
+Candidate loading is transactional after the rollback snapshot is saved. Any
+subsequent object write, spoke cleanup, or post-write verification error causes
+the tool to issue Panorama's candidate rollback command before releasing its
+configuration lock. This restores candidate configuration to running config
+without a commit; it also discards other pending candidate changes. The named
+snapshot remains available for manual recovery but is not loaded automatically.
+If Panorama rejects the rollback, the command reports both failures and warns
+that partial candidate changes may remain.
