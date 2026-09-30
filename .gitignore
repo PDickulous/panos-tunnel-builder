@@ -11,3 +11,6 @@ build/
 dist/
 migration-snapshots/
 .vscode/
+
+# Local connection settings may contain API keys.
+/panos-tunnel-builder.toml

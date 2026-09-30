@@ -550,6 +550,7 @@ def test_capture_queries_logical_router_once_for_multiple_vrfs(
     )
 
     assert snapshot.routes == ()
+    assert snapshot.bgp_peer_count == 0
     assert snapshot.captured_at == "2026-08-19T00:00:00+00:00"
     assert op.call_count == 1
     read_effective.assert_called_once_with(panorama, "001122", "vsys1")
@@ -559,6 +560,26 @@ def test_capture_queries_logical_router_once_for_multiple_vrfs(
         "vsys1",
         effective=effective,
     )
+
+
+def test_counts_configured_legacy_and_advanced_bgp_peers() -> None:
+    effective = ET.fromstring(
+        """
+        <config><network>
+          <virtual-router><entry name="default"><protocol><bgp><peer-group>
+            <entry name="legacy"><peer><entry name="peer-1" />
+              <entry name="peer-2" /></peer></entry>
+          </peer-group></bgp></protocol></entry></virtual-router>
+          <logical-router><entry name="MainLR"><vrf><entry name="default"><bgp>
+            <peer-group><entry name="advanced"><peer>
+              <entry name="peer-3" />
+            </peer></entry></peer-group>
+          </bgp></entry></vrf></entry></logical-router>
+        </network></config>
+        """
+    )
+
+    assert route_validation._configured_bgp_peer_count(effective) == 3
 
 
 def test_parse_mapping_rejects_malformed_values() -> None:
@@ -595,7 +616,7 @@ def test_verify_migration_cli_captures_and_compares_post_routes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    before = _snapshot(_route())
+    before = replace(_snapshot(_route()), bgp_peer_count=2)
     baseline = tmp_path / "spoke_routes.json"
     baseline.write_text(before.to_json(), encoding="utf-8")
     manifest = MigrationValidationManifest(
@@ -627,15 +648,13 @@ def test_verify_migration_cli_captures_and_compares_post_routes(
     manifest_path.write_text(manifest.to_json(), encoding="utf-8")
     monkeypatch.setattr(cli, "load_settings", Mock())
     monkeypatch.setattr(cli, "create_panorama", Mock(return_value=Mock()))
-    monkeypatch.setattr(
-        cli,
-        "capture_route_snapshot",
-        Mock(
-            return_value=_snapshot(
-                _route(interface="tunnel.21", next_hop="169.254.240.2")
-            )
-        ),
+    capture = Mock(
+        return_value=replace(
+            _snapshot(_route(interface="tunnel.21", next_hop="169.254.240.2")),
+            bgp_peer_count=2,
+        )
     )
+    monkeypatch.setattr(cli, "capture_route_snapshot", capture)
 
     result = runner.invoke(
         cli.app,
@@ -643,5 +662,26 @@ def test_verify_migration_cli_captures_and_compares_post_routes(
     )
 
     assert result.exit_code == 0
+    assert "Configured BGP peers: pre=2, post=2" in result.output
     assert "Migration route verification passed" in result.output
     assert len(tuple(tmp_path.glob("LSVPN_POST_MIGRATION_*_routes.json"))) == 1
+
+    baseline.write_text(
+        replace(before, bgp_peer_count=3).to_json(),
+        encoding="utf-8",
+    )
+    mismatch = runner.invoke(
+        cli.app,
+        ["routes", "verify-migration", str(manifest_path)],
+    )
+
+    assert mismatch.exit_code == 1
+    assert "Configured BGP peers: pre=3, post=2" in mismatch.output
+
+
+@pytest.mark.parametrize("endpoints", [[], {}, ""])
+def test_manifest_rejects_empty_or_invalid_endpoints(endpoints: object) -> None:
+    with pytest.raises(RouteValidationError, match="non-empty JSON array"):
+        MigrationValidationManifest.from_json(
+            json.dumps({"schema_version": 1, "endpoints": endpoints})
+        )

@@ -65,6 +65,7 @@ class RouteSnapshot:
     captured_at: str
     routes: tuple[RouteEntry, ...]
     routing_configuration: tuple[str, ...] = ()
+    bgp_peer_count: int | None = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, sort_keys=True) + "\n"
@@ -81,6 +82,7 @@ class RouteSnapshot:
                 )
             routes_value = document["routes"]
             routing_configuration_value = document.get("routing_configuration", [])
+            bgp_peer_count_value = document.get("bgp_peer_count")
             if not isinstance(routes_value, list):
                 raise RouteValidationError("Snapshot routes must be a JSON array.")
             if not isinstance(routing_configuration_value, list) or not all(
@@ -88,6 +90,14 @@ class RouteSnapshot:
             ):
                 raise RouteValidationError(
                     "Snapshot routing_configuration must be an array of XML strings."
+                )
+            if bgp_peer_count_value is not None and (
+                isinstance(bgp_peer_count_value, bool)
+                or not isinstance(bgp_peer_count_value, int)
+                or bgp_peer_count_value < 0
+            ):
+                raise RouteValidationError(
+                    "Snapshot bgp_peer_count must be a non-negative integer."
                 )
             routes = tuple(_route_from_dict(item) for item in routes_value)
             return cls(
@@ -98,6 +108,7 @@ class RouteSnapshot:
                 captured_at=str(document["captured_at"]),
                 routes=routes,
                 routing_configuration=tuple(routing_configuration_value),
+                bgp_peer_count=bgp_peer_count_value,
             )
         except RouteValidationError:
             raise
@@ -167,8 +178,13 @@ class MigrationValidationManifest:
                     f"Unsupported migration manifest schema version "
                     f"{schema_version}; expected {SCHEMA_VERSION}."
                 )
+            endpoint_values = document["endpoints"]
+            if not isinstance(endpoint_values, list) or not endpoint_values:
+                raise RouteValidationError(
+                    "Migration manifest endpoints must be a non-empty JSON array."
+                )
             endpoints = tuple(
-                _migration_endpoint_from_dict(item) for item in document["endpoints"]
+                _migration_endpoint_from_dict(item) for item in endpoint_values
             )
             return cls(
                 schema_version=schema_version,
@@ -374,6 +390,17 @@ def _routing_configuration_entries(root: ET.Element) -> tuple[str, ...]:
     return tuple(sorted(entries))
 
 
+def _configured_bgp_peer_count(root: ET.Element) -> int:
+    """Count configured BGP peers across legacy and advanced routing."""
+    legacy = root.findall(
+        ".//network/virtual-router/entry/protocol/bgp/peer-group/entry/peer/entry"
+    )
+    advanced = root.findall(
+        ".//network/logical-router/entry/vrf/entry/bgp/peer-group/entry/peer/entry"
+    )
+    return len(legacy) + len(advanced)
+
+
 def _route_command(routing: RoutingInstanceConfig) -> bytes:
     show = ET.Element("show")
     if routing.kind == "virtual-router":
@@ -429,6 +456,7 @@ def capture_route_snapshot(
         captured_at=timestamp.isoformat(),
         routes=tuple(sorted(routes, key=_route_sort_key)),
         routing_configuration=_routing_configuration_entries(effective),
+        bgp_peer_count=_configured_bgp_peer_count(effective),
     )
 
 

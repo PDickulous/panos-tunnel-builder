@@ -562,7 +562,15 @@ def test_candidate_reload_updates_owned_objects_with_a_fresh_plan(
             element = replacement.spoke.ipsec_crypto_profile.element()
         elif "tunnel.3" in xpath or "tunnel.11" in xpath:
             element = ET.fromstring(f"<entry><comment>{marker}</comment></entry>")
-        elif rerun_plan.ike_gateway_name in xpath or rerun_plan.tunnel_name in xpath:
+        elif any(
+            name in xpath
+            for name in (
+                rerun_plan.ike_gateway_name,
+                rerun_plan.tunnel_name,
+                rerun_plan.spoke_ike_gateway_name,
+                rerun_plan.spoke_tunnel_name,
+            )
+        ):
             element = ET.Element("entry")
         else:
             return ET.fromstring("<response><result /></response>")

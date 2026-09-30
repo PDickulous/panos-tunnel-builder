@@ -1,0 +1,41 @@
+# Environment variables override matching values in this section.
+[panorama]
+host = "panorama.example.com"
+api_key = "replace-with-api-key"
+port = 443
+verify_ssl = true
+
+[build]
+firewall = "branch-01"
+template_number = 2
+hub = "hub-01"
+hub_template_number = 2
+vsys = "vsys1"
+hub_vsys = "vsys1"
+tunnel_address_pool = "10.254.0.0/24"
+snapshot_directory = "migration-snapshots"
+show_secrets = false
+load_candidate = false
+allow_dirty_candidate = false
+yes = false
+
+[routes.snapshot]
+firewall = "branch-01"
+output = "branch-01-routes.json"
+vsys = "vsys1"
+force = false
+
+[routes.compare]
+before = "before.json"
+after = "after.json"
+prefix_map = ["10.0.0.0/30=10.1.0.0/30"]
+interface_map = ["tunnel.2=tunnel.3"]
+next_hop_map = ["10.0.0.1=10.1.0.1"]
+
+[routes.verify-migration]
+manifest = "migration-validation.json"
+output_directory = "migration-snapshots"
+
+[candidate.restore]
+snapshot = "LSVPN_PRE_example.xml"
+yes = false

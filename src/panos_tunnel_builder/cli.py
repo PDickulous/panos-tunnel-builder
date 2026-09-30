@@ -20,7 +20,7 @@ from .candidate import (
     load_panorama_snapshot,
     resolve_template_interface_address_reference,
 )
-from .config import load_settings
+from .config import ConfigurationFileError, configure_from_file, load_settings
 from .inventory import (
     DiscoveryError,
     FirewallTemplateInventory,
@@ -109,8 +109,23 @@ class SharedBuildResult:
 
 
 @app.callback()
-def cli() -> None:
+def cli(
+    ctx: typer.Context,
+    config: Annotated[
+        Path | None,
+        typer.Option(
+            "--config",
+            "-c",
+            help="TOML file containing Panorama settings and command defaults.",
+        ),
+    ] = None,
+) -> None:
     """Build and manage PAN-OS IPsec tunnels through Panorama."""
+    try:
+        ctx.default_map = configure_from_file(config)
+    except ConfigurationFileError as exc:
+        typer.echo(f"Configuration file error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
 
 
 @app.command()
@@ -157,7 +172,10 @@ def routes_snapshot(
     ] = DEFAULT_VSYS,
     force: Annotated[
         bool,
-        typer.Option("--force", help="Overwrite an existing snapshot file."),
+        typer.Option(
+            "--force/--no-force",
+            help="Overwrite an existing snapshot file.",
+        ),
     ] = False,
 ) -> None:
     """Capture all IPv4 and IPv6 RIBs from a managed firewall."""
@@ -623,6 +641,19 @@ def routes_verify_migration(
             typer.echo(
                 f'{endpoint.role.capitalize()} firewall "{endpoint.firewall_name}":'
             )
+            bgp_peer_counts_match = (
+                baseline.bgp_peer_count is None
+                or after.bgp_peer_count == baseline.bgp_peer_count
+            )
+            if baseline.bgp_peer_count is None:
+                typer.echo(
+                    "  Configured BGP peers: unavailable in this older baseline"
+                )
+            else:
+                typer.echo(
+                    f"  Configured BGP peers: pre={baseline.bgp_peer_count}, "
+                    f"post={after.bgp_peer_count}"
+                )
             _show_route_comparison(comparison)
             if not baseline.routing_configuration:
                 typer.echo(
@@ -636,7 +667,12 @@ def routes_verify_migration(
             else:
                 typer.echo("  Routing configuration: expected changes only")
             typer.echo(f'  Post-change snapshot: "{after_path}"')
-            failed = failed or not comparison.equivalent or bool(routing_config_changes)
+            failed = (
+                failed
+                or not bgp_peer_counts_match
+                or not comparison.equivalent
+                or bool(routing_config_changes)
+            )
         if failed:
             raise typer.Exit(code=1)
         typer.echo("Migration route verification passed for every endpoint.")
@@ -659,7 +695,11 @@ def candidate_restore(
     ],
     yes: Annotated[
         bool,
-        typer.Option("--yes", "-y", help="Skip the candidate replacement prompt."),
+        typer.Option(
+            "--yes/--no-yes",
+            "-y",
+            help="Skip the candidate replacement prompt.",
+        ),
     ] = False,
 ) -> None:
     """Restore a saved snapshot to Panorama candidate without committing."""
@@ -1026,6 +1066,7 @@ def _build_shared_migration(
                 spoke_identity=spoke.serial,
                 spoke_hostname=spoke.firewall_name,
                 hub_hostname=hub_inventory.firewall_name,
+                tunnel_sequence=satellite_index + 1,
             )
             replacement = build_standard_ipsec_objects(plan, shared_spoke_names=True)
             planned.append(SharedSpokeReplacement(spoke, plan, replacement))
@@ -1277,7 +1318,7 @@ def build(
     show_secrets: Annotated[
         bool,
         typer.Option(
-            "--show-secrets",
+            "--show-secrets/--no-show-secrets",
             help="Display generated pre-shared keys in terminal output.",
         ),
     ] = False,
@@ -1294,7 +1335,7 @@ def build(
     load_candidate: Annotated[
         bool,
         typer.Option(
-            "--load-candidate",
+            "--load-candidate/--no-load-candidate",
             help=(
                 "Save pre-migration state and load the replacement into the "
                 "Panorama candidate configuration without committing."
@@ -1304,7 +1345,7 @@ def build(
     allow_dirty_candidate: Annotated[
         bool,
         typer.Option(
-            "--allow-dirty-candidate",
+            "--allow-dirty-candidate/--no-allow-dirty-candidate",
             help=(
                 "Allow loading when Panorama already has pending candidate changes; "
                 "an error will revert all pending changes to running configuration."
@@ -1321,7 +1362,7 @@ def build(
     yes: Annotated[
         bool,
         typer.Option(
-            "--yes",
+            "--yes/--no-yes",
             "-y",
             help="Accept selections and candidate loading without confirmation.",
         ),

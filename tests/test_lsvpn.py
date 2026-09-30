@@ -123,7 +123,7 @@ def test_scoped_names_keep_spoke_identity_when_source_name_is_long() -> None:
     assert len(plan.ike_gateway_name) <= 63
 
 
-def test_endpoint_names_show_hub_spoke_and_three_digit_collision_number() -> None:
+def test_endpoint_names_use_destination_hostname_and_sequence() -> None:
     source = lsvpn._to_satellite_config(_satellite_tunnel())
 
     plan = lsvpn.build_standard_clone_plan(
@@ -132,14 +132,28 @@ def test_endpoint_names_show_hub_spoke_and_three_digit_collision_number() -> Non
         spoke_identity="001122",
         spoke_hostname="branch 01.example.com",
         hub_hostname="hub-01.example.com",
+        tunnel_sequence=4,
     )
 
-    assert plan.tunnel_name.startswith("hub-01.example.com-to-branch-01.example.com-")
-    assert plan.tunnel_name[-4] == "-"
-    assert plan.tunnel_name[-3:].isdigit()
+    assert plan.tunnel_name == "branch-01.example.com-4"
     assert plan.ike_gateway_name == f"{plan.tunnel_name}-ike"
+    assert plan.spoke_tunnel_name == "hub-01.example.com-4"
+    assert plan.spoke_ike_gateway_name == "hub-01.example.com-4-ike"
     assert len(plan.tunnel_name) <= 59
     assert len(plan.ike_gateway_name) <= 63
+
+
+def test_endpoint_name_rejects_non_positive_sequence() -> None:
+    source = lsvpn._to_satellite_config(_satellite_tunnel())
+
+    with pytest.raises(ValueError, match="positive integer"):
+        lsvpn.build_standard_clone_plan(
+            source,
+            pre_shared_key="test-generated-psk",
+            spoke_hostname="branch-01",
+            hub_hostname="hub-01",
+            tunnel_sequence=0,
+        )
 
 
 def test_preserves_portal_routing_priority_as_static_route_metric() -> None:

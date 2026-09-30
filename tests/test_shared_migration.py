@@ -114,10 +114,8 @@ def test_shared_spoke_uses_one_structure_with_per_device_values() -> None:
     assert items[1].replacement.spoke.ike_gateway.name == (
         items[1].plan.shared_spoke_ike_gateway_name
     )
-    assert "hub-01-to-shared-spokes-" in str(
-        items[0].replacement.spoke.ipsec_tunnel.name
-    )
-    assert "hub-01-to-branch-001-" in str(items[0].replacement.hub.ipsec_tunnel.name)
+    assert items[0].replacement.spoke.ipsec_tunnel.name == "hub-01-1"
+    assert items[0].replacement.hub.ipsec_tunnel.name == "branch-001-1"
     assert (
         items[0].replacement.spoke.ike_gateway.pre_shared_key
         == items[1].replacement.spoke.ike_gateway.pre_shared_key

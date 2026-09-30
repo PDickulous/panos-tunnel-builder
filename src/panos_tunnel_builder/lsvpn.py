@@ -308,6 +308,7 @@ class StandardIpsecClonePlan:
     spoke_identity: str | None
     spoke_hostname: str | None
     hub_hostname: str | None
+    tunnel_sequence: int
     tunnel_name: str
     ike_gateway_name: str
     tunnel_interface: str | None
@@ -344,20 +345,24 @@ class StandardIpsecClonePlan:
     warnings: tuple[str, ...]
 
     @property
-    def shared_spoke_tunnel_name(self) -> str:
+    def spoke_tunnel_name(self) -> str:
         if self.hub_hostname:
-            return _endpoint_object_name(
-                self.hub_hostname,
-                "shared-spokes",
-                self.source_name,
-            )
+            return _destination_object_name(self.hub_hostname, self.tunnel_sequence)
         return f"{self.source_name[:54]}-standard"
 
     @property
-    def shared_spoke_ike_gateway_name(self) -> str:
+    def spoke_ike_gateway_name(self) -> str:
         if self.hub_hostname:
-            return _ike_gateway_name(self.shared_spoke_tunnel_name)
-        return f"{self.source_name[:59]}-ike"
+            return _ike_gateway_name(self.spoke_tunnel_name)
+        return self.ike_gateway_name
+
+    @property
+    def shared_spoke_tunnel_name(self) -> str:
+        return self.spoke_tunnel_name
+
+    @property
+    def shared_spoke_ike_gateway_name(self) -> str:
+        return self.spoke_ike_gateway_name
 
 
 @dataclass(frozen=True)
@@ -1877,6 +1882,7 @@ def build_standard_clone_plan(
     spoke_identity: str | None = None,
     spoke_hostname: str | None = None,
     hub_hostname: str | None = None,
+    tunnel_sequence: int = 1,
 ) -> StandardIpsecClonePlan:
     """Map reusable satellite settings into a standard auto-key tunnel plan."""
     selected_crypto = crypto or StandardCryptoSettings()
@@ -2010,12 +2016,12 @@ def build_standard_clone_plan(
     spoke_routes = tuple(dict.fromkeys((*spoke_routes, *spoke_bgp_host_routes)))
     hub_routes = tuple(dict.fromkeys((*hub_routes, *hub_bgp_host_routes)))
 
+    if tunnel_sequence < 1:
+        raise ValueError("Tunnel sequence must be a positive integer.")
     if spoke_hostname and hub_hostname:
-        tunnel_name = _endpoint_object_name(
-            hub_hostname,
-            spoke_hostname,
-            satellite.name,
-        )
+        # The hub-side object's destination is the spoke firewall.  The
+        # corresponding spoke-side name is exposed by ``spoke_tunnel_name``.
+        tunnel_name = _destination_object_name(spoke_hostname, tunnel_sequence)
         ike_gateway_name = _ike_gateway_name(tunnel_name)
     else:
         tunnel_name = f"{satellite.name}-standard"
@@ -2033,6 +2039,7 @@ def build_standard_clone_plan(
         spoke_identity=spoke_identity,
         spoke_hostname=spoke_hostname,
         hub_hostname=hub_hostname,
+        tunnel_sequence=tunnel_sequence,
         tunnel_name=tunnel_name,
         ike_gateway_name=ike_gateway_name,
         tunnel_interface=satellite.tunnel_interface,
@@ -2160,10 +2167,12 @@ def build_standard_ipsec_objects(
     spoke_ike_name = (
         plan.shared_spoke_ike_gateway_name
         if shared_spoke_names
-        else plan.ike_gateway_name
+        else plan.spoke_ike_gateway_name
     )
     spoke_tunnel_name = (
-        plan.shared_spoke_tunnel_name if shared_spoke_names else plan.tunnel_name
+        plan.shared_spoke_tunnel_name
+        if shared_spoke_names
+        else plan.spoke_tunnel_name
     )
     spoke_ike = IkeGateway(
         spoke_ike_name,
@@ -2648,22 +2657,12 @@ def _safe_object_name_part(value: str) -> str:
     return cleaned or "unnamed"
 
 
-def _endpoint_object_name(hub: str, spoke: str, source: str) -> str:
-    """Build a readable endpoint name with a deterministic three-digit suffix."""
-    safe_hub = _safe_object_name_part(hub)
-    safe_spoke = _safe_object_name_part(spoke)
-    identity = f"{safe_hub.casefold()}\0{safe_spoke.casefold()}\0{source.casefold()}"
-    number = (
-        int.from_bytes(hashlib.sha256(identity.encode()).digest()[:4], "big") % 1000
-    )
-    suffix = f"-{number:03d}"
-    separator = "-to-"
-    # Reserve four characters for the IKE gateway's ``-ike`` suffix so both
-    # related objects retain the complete hub/spoke identity.
-    available = 59 - len(separator) - len(suffix)
-    hub_budget = max(1, available // 2)
-    spoke_budget = max(1, available - hub_budget)
-    return f"{safe_hub[:hub_budget]}{separator}{safe_spoke[:spoke_budget]}{suffix}"
+def _destination_object_name(destination: str, sequence: int) -> str:
+    """Name an endpoint object for its destination and migration sequence."""
+    suffix = f"-{sequence}"
+    # Reserve four characters for the IKE gateway's ``-ike`` suffix.
+    destination_budget = 59 - len(suffix)
+    return f"{_safe_object_name_part(destination)[:destination_budget]}{suffix}"
 
 
 def _ike_gateway_name(tunnel_name: str) -> str:

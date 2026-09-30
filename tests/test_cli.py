@@ -84,6 +84,7 @@ def test_help_lists_status_command() -> None:
 
     assert result.exit_code == 0
     assert "status" in result.output
+    assert "--config" in result.output
     assert "Interactively build and manage PAN-OS IPsec tunnels" in result.output
 
 
@@ -209,6 +210,96 @@ def test_build_selects_only_template_with_interfaces(
     assert 'Spoke template: "branch-network"' in result.output
     assert "Hub firewall: hub-01" in result.output
     assert 'Hub template: "hub-network"' in result.output
+
+
+def test_build_uses_toml_command_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "tunnels.toml"
+    config.write_text(
+        """
+[build]
+firewall = "branch-01"
+template_number = 2
+hub = "hub-01"
+hub_template_number = 2
+yes = true
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "load_settings", Mock(return_value=Mock()))
+    monkeypatch.setattr(cli, "create_panorama", Mock(return_value=Mock()))
+    discovery = Mock(
+        side_effect=[_template_inventory(), _hub_template_inventory()]
+    )
+    monkeypatch.setattr(cli, "discover_firewall_templates", discovery)
+    monkeypatch.setattr(cli, "discover_lsvpn_satellites", Mock(return_value=()))
+
+    result = runner.invoke(cli.app, ["--config", str(config), "build"])
+
+    assert result.exit_code == 0
+    assert "Requested spoke: branch-01" in result.output
+    assert 'Spoke template: "branch-network"' in result.output
+    assert "Hub firewall: hub-01" in result.output
+    assert 'Hub template: "hub-network"' in result.output
+    assert [call.args[1] for call in discovery.call_args_list] == [
+        "branch-01",
+        "hub-01",
+    ]
+
+
+def test_command_line_value_overrides_toml_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "tunnels.toml"
+    config.write_text('[build]\nfirewall = "wrong-branch"\n', encoding="utf-8")
+    monkeypatch.setattr(cli, "load_settings", Mock(return_value=Mock()))
+    monkeypatch.setattr(cli, "create_panorama", Mock(return_value=Mock()))
+    discovery = Mock(return_value=_template_inventory())
+    monkeypatch.setattr(cli, "discover_firewall_templates", discovery)
+
+    result = runner.invoke(
+        cli.app,
+        ["--config", str(config), "build", "branch-01", "--template-number", "1"],
+    )
+
+    assert result.exit_code == 1
+    assert discovery.call_args.args[1] == "branch-01"
+    assert "does not contain interface configuration" in result.output
+
+
+def test_config_file_error_is_reported(tmp_path: Path) -> None:
+    config = tmp_path / "tunnels.toml"
+    config.write_text('[build]\nunknown = true\n', encoding="utf-8")
+
+    result = runner.invoke(cli.app, ["--config", str(config), "build"])
+
+    assert result.exit_code == 2
+    assert "Configuration file error" in result.output
+    assert "unknown" in result.output
+
+
+def test_toml_defaults_apply_to_nested_command(tmp_path: Path) -> None:
+    config = tmp_path / "tunnels.toml"
+    config.write_text(
+        """
+[routes.compare]
+before = "missing-before.json"
+after = "missing-after.json"
+""",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        cli.app,
+        ["--config", str(config), "routes", "compare"],
+    )
+
+    assert result.exit_code == 1
+    assert "Route snapshot file error" in result.output
+    assert "missing-before.json" in result.output
 
 
 def test_load_candidate_is_successful_noop_when_satellite_is_already_absent(
@@ -573,15 +664,13 @@ def test_build_reports_lsvpn_clone_plan(
     assert "Tunnel address pool (IPv4 /30s or IPv6 /127s)" in result.output
     assert "Shared spoke configuration" in result.output
     assert "Replaces: legacy-satellite on tunnel.2" in result.output
-    assert (
-        "Creates: hub-01-to-shared-spokes-051 / hub-01-to-shared-spokes-051-ike"
-    ) in result.output
+    assert "Creates: hub-01-1 / hub-01-1-ike" in result.output
     assert "Hub endpoint: ethernet1/3 / 198.51.100.20/24" in result.output
     assert "Per-spoke tunnel plan" in result.output
     assert "branch-01 (001122)" in result.output
     assert "WAN: ethernet1/1 / 203.0.113.13/24 -> 198.51.100.20" in result.output
     assert "Tunnel: spoke tunnel.1 (10.254.0.2/30) <-> hub tunnel.1" in result.output
-    assert "Hub objects: hub-01-to-branch-01-638" in result.output
+    assert "Hub objects: branch-01-1 / branch-01-1-ike" in result.output
     assert "differs from configured portal address" in result.output
     assert "PSK for new variables: [hidden]" in result.output
     assert "Candidate load result" in result.output
@@ -595,6 +684,7 @@ def test_build_reports_lsvpn_clone_plan(
     assert "Post-check manifest:" in result.output
     assert discover_placements.call_count == 1
     assert load_candidate.call_count == 1
+    assert load_candidate.call_args.args[3][0].spoke.routing_object.name == "default"
     assert "SHA-256" in result.output
     assert "Crypto: IKEV2 aes-256-cbc/sha256" in result.output
     assert "AH alternative authentication" not in result.output
@@ -832,3 +922,10 @@ def test_resolve_portal_gateway_prefers_the_active_gateway() -> None:
     result = cli._resolve_portal_gateway(gateways, runtime, True)
 
     assert result == gateways[1]
+
+
+def test_build_rejects_removed_router_rename_option() -> None:
+    result = runner.invoke(cli.app, ["build", "--virtual-router-name", "branch-vr"])
+
+    assert result.exit_code == 2
+    assert "No such option" in result.output
