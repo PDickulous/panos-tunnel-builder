@@ -25,7 +25,7 @@ and preview a migration:
 
 ```bash
 panos-tunnel-builder status
-panos-tunnel-builder build branch-01 --hub hub-01 --tunnel-address-pool 10.254.0.0/24
+panos-tunnel-builder build branch-01 --hub-firewall hub-01 --tunnel-address-pool 10.254.0.0/24
 ```
 
 Replace the firewall names and address pool with values appropriate to your

@@ -21,35 +21,50 @@ class ConfigurationFileError(RuntimeError):
 
 _panorama_file_settings: dict[str, object] = {}
 
+# Public TOML names map to the existing Click parameter names.
+_COMMAND_KEY_MAPS: dict[tuple[str, ...], dict[str, str]] = {
+    ("build",): {
+        "spoke_firewall": "firewall",
+        "hub_firewall": "hub",
+        "spoke_template_menu_number": "template_number",
+        "hub_template_menu_number": "hub_template_number",
+        "spoke_vsys": "vsys",
+        "allow_pending_candidate_changes": "allow_dirty_candidate",
+        "migration_artifact_directory": "snapshot_directory",
+    },
+    ("routes", "snapshot"): {
+        "output_file": "output",
+        "overwrite_existing_file": "force",
+    },
+    ("routes", "verify-migration"): {"manifest_file": "manifest"},
+    ("candidate", "restore"): {"snapshot_name": "snapshot"},
+}
+
 _CONFIGURATION_KEYS: dict[str, object] = {
     "panorama": {"host", "api_key", "port", "verify_ssl"},
     "status": set(),
     "build": {
-        "firewall",
-        "template_number",
-        "hub",
-        "hub_template_number",
-        "vsys",
+        "spoke_firewall",
+        "hub_firewall",
+        "spoke_template_name",
+        "hub_template_name",
+        "spoke_template_menu_number",
+        "hub_template_menu_number",
+        "spoke_vsys",
         "hub_vsys",
         "show_secrets",
         "tunnel_address_pool",
         "load_candidate",
-        "allow_dirty_candidate",
-        "snapshot_directory",
-        "yes",
+        "allow_pending_candidate_changes",
+        "migration_artifact_directory",
+        "skip_confirmation",
     },
     "routes": {
-        "snapshot": {"firewall", "output", "vsys", "force"},
-        "compare": {
-            "before",
-            "after",
-            "prefix_map",
-            "interface_map",
-            "next_hop_map",
-        },
-        "verify-migration": {"manifest", "output_directory"},
+        "snapshot": {"firewall", "output_file", "vsys", "overwrite_existing_file"},
+        "compare": {"before", "after", "prefix_map", "interface_map", "next_hop_map"},
+        "verify-migration": {"manifest_file", "output_directory"},
     },
-    "candidate": {"restore": {"snapshot", "yes"}},
+    "candidate": {"restore": {"snapshot_name", "skip_confirmation"}},
 }
 
 
@@ -108,6 +123,26 @@ def configure_from_file(path: Path | None) -> dict[str, Any]:
         raise ConfigurationFileError(
             'Configuration value "panorama.verify_ssl" must be a boolean.'
         )
+    for location, defaults in (
+        ("build", values.get("build", {})),
+        ("candidate.restore", values.get("candidate", {}).get("restore", {})),
+    ):
+        if "skip_confirmation" in defaults:
+            skip_confirmation = defaults.pop("skip_confirmation")
+            if not isinstance(skip_confirmation, bool):
+                raise ConfigurationFileError(
+                    f'Configuration value "{location}.skip_confirmation" '
+                    "must be a boolean."
+                )
+            # Click defaults use the Python parameter name for --yes/-y.
+            defaults["yes"] = skip_confirmation
+    for path_parts, key_map in _COMMAND_KEY_MAPS.items():
+        defaults = values
+        for part in path_parts:
+            defaults = defaults.get(part, {})
+        for public_name, parameter_name in key_map.items():
+            if public_name in defaults:
+                defaults[parameter_name] = defaults.pop(public_name)
     _panorama_file_settings = panorama
     return values
 

@@ -164,7 +164,9 @@ def routes_snapshot(
     ],
     output: Annotated[
         Path,
-        typer.Argument(help="Local JSON file to receive the route snapshot."),
+        typer.Argument(
+            metavar="OUTPUT_FILE", help="Local JSON file to receive the route snapshot."
+        ),
     ],
     vsys: Annotated[
         str,
@@ -173,6 +175,7 @@ def routes_snapshot(
     force: Annotated[
         bool,
         typer.Option(
+            "--overwrite-existing-file/--no-overwrite-existing-file",
             "--force/--no-force",
             help="Overwrite an existing snapshot file.",
         ),
@@ -182,7 +185,8 @@ def routes_snapshot(
     try:
         if output.exists() and not force:
             raise RouteValidationError(
-                f'Snapshot file "{output}" already exists; use --force to overwrite it.'
+                f'Snapshot file "{output}" already exists; '
+                "use --overwrite-existing-file to overwrite it."
             )
         settings = load_settings()
         panorama = create_panorama(settings)
@@ -586,7 +590,10 @@ def _build_group_migration_manifest(
 def routes_verify_migration(
     manifest: Annotated[
         Path,
-        typer.Argument(help="Migration validation manifest JSON file."),
+        typer.Argument(
+            metavar="MANIFEST_FILE",
+            help="Local migration validation manifest JSON file.",
+        ),
     ],
     output_directory: Annotated[
         Path | None,
@@ -646,9 +653,7 @@ def routes_verify_migration(
                 or after.bgp_peer_count == baseline.bgp_peer_count
             )
             if baseline.bgp_peer_count is None:
-                typer.echo(
-                    "  Configured BGP peers: unavailable in this older baseline"
-                )
+                typer.echo("  Configured BGP peers: unavailable in this older baseline")
             else:
                 typer.echo(
                     f"  Configured BGP peers: pre={baseline.bgp_peer_count}, "
@@ -691,7 +696,10 @@ def routes_verify_migration(
 def candidate_restore(
     snapshot: Annotated[
         str,
-        typer.Argument(help="Named Panorama configuration snapshot to load."),
+        typer.Argument(
+            metavar="SNAPSHOT_NAME",
+            help="Saved configuration name on Panorama, not a local file path.",
+        ),
     ],
     yes: Annotated[
         bool,
@@ -754,7 +762,27 @@ def _resolve_template(
     inventory: FirewallTemplateInventory,
     requested_number: int | None,
     role: str,
+    requested_name: str | None = None,
 ) -> TemplateCandidate:
+    if requested_name is not None:
+        matches = tuple(
+            template
+            for template in inventory.templates
+            if template.name == requested_name
+        )
+        if len(matches) != 1:
+            raise DiscoveryError(
+                f'{role} template name "{requested_name}" must match exactly one '
+                f'template in stack "{inventory.stack_name}". Available names: '
+                + ", ".join(template.name for template in inventory.templates)
+            )
+        selected = matches[0]
+        if not selected.eligible:
+            raise DiscoveryError(
+                f'Template "{selected.name}" does not contain interface configuration.'
+            )
+        return selected
+
     eligible = inventory.eligible_templates
     if not eligible:
         raise DiscoveryError(
@@ -772,7 +800,7 @@ def _resolve_template(
         selected_number = requested_number
         if selected_number is None:
             selected_number = typer.prompt(
-                f"{role} template number",
+                f"{role} template menu number",
                 default=recommended_number,
                 type=int,
             )
@@ -1272,23 +1300,68 @@ def _resolve_hub_ike_endpoint(
     )
 
 
+def _template_selection(
+    ctx: typer.Context,
+    role: str,
+    name: str | None,
+    number: int | None,
+    name_parameter: str,
+    number_parameter: str,
+) -> tuple[str | None, int | None]:
+    """Let an explicit selector override the opposite selector from TOML."""
+    if name is not None and number is not None:
+        name_source = ctx.get_parameter_source(name_parameter)
+        number_source = ctx.get_parameter_source(number_parameter)
+        name_explicit = name_source is not None and name_source.name == "COMMANDLINE"
+        number_explicit = (
+            number_source is not None and number_source.name == "COMMANDLINE"
+        )
+        if name_explicit and not number_explicit:
+            return name, None
+        if number_explicit and not name_explicit:
+            return None, number
+        raise typer.BadParameter(
+            f"Choose one {role} template selector: name or menu number."
+        )
+    return name, number
+
+
 @app.command()
 def build(
+    ctx: typer.Context,
     firewall: Annotated[
         str | None,
-        typer.Argument(help="Firewall hostname or serial number."),
+        typer.Argument(
+            metavar="SPOKE_FIREWALL", help="Spoke firewall hostname or serial number."
+        ),
+    ] = None,
+    spoke_template_name: Annotated[
+        str | None,
+        typer.Option(
+            "--spoke-template-name",
+            help="Exact spoke template name; alternative to a menu number.",
+        ),
+    ] = None,
+    hub_template_name: Annotated[
+        str | None,
+        typer.Option(
+            "--hub-template-name",
+            help="Exact hub template name in its stack; alternative to a menu number.",
+        ),
     ] = None,
     template_number: Annotated[
         int | None,
         typer.Option(
+            "--spoke-template-menu-number",
             "--template-number",
             "-t",
-            help="Spoke template menu number; prompts when omitted.",
+            help="Spoke menu position; prompts if neither name nor number is given.",
         ),
     ] = None,
     hub: Annotated[
         str | None,
         typer.Option(
+            "--hub-firewall",
             "--hub",
             "-H",
             help="Hub firewall hostname or serial; prompts when omitted.",
@@ -1297,13 +1370,15 @@ def build(
     hub_template_number: Annotated[
         int | None,
         typer.Option(
+            "--hub-template-menu-number",
             "--hub-template-number",
-            help="Hub template menu number; prompts when omitted.",
+            help="Hub menu position; prompts if neither name nor number is given.",
         ),
     ] = None,
     vsys: Annotated[
         str,
         typer.Option(
+            "--spoke-vsys",
             "--vsys",
             help="Spoke virtual system containing the LSVPN configuration.",
         ),
@@ -1345,6 +1420,7 @@ def build(
     allow_dirty_candidate: Annotated[
         bool,
         typer.Option(
+            "--allow-pending-candidate-changes/--no-allow-pending-candidate-changes",
             "--allow-dirty-candidate/--no-allow-dirty-candidate",
             help=(
                 "Allow loading when Panorama already has pending candidate changes; "
@@ -1355,8 +1431,9 @@ def build(
     snapshot_directory: Annotated[
         Path,
         typer.Option(
+            "--migration-artifact-directory",
             "--snapshot-directory",
-            help="Directory for pre-migration route snapshots.",
+            help="Directory for baseline route snapshots and the validation manifest.",
         ),
     ] = Path("migration-snapshots"),
     yes: Annotated[
@@ -1364,21 +1441,45 @@ def build(
         typer.Option(
             "--yes/--no-yes",
             "-y",
-            help="Accept selections and candidate loading without confirmation.",
+            help=(
+                "Skip selection/load confirmations and accept portal/active-gateway "
+                "mismatches. Missing firewall, template, or address-pool inputs "
+                "still prompt."
+            ),
         ),
     ] = False,
 ) -> None:
     """Select the spoke and hub firewalls and their network templates."""
+    spoke_template_name, template_number = _template_selection(
+        ctx,
+        "spoke",
+        spoke_template_name,
+        template_number,
+        "spoke_template_name",
+        "template_number",
+    )
+    hub_template_name, hub_template_number = _template_selection(
+        ctx,
+        "hub",
+        hub_template_name,
+        hub_template_number,
+        "hub_template_name",
+        "hub_template_number",
+    )
     try:
-        firewall_name = firewall or typer.prompt("Spoke Firewall Name")
+        firewall_name = firewall or typer.prompt(
+            "Spoke firewall hostname or serial number"
+        )
         settings = load_settings()
         panorama = create_panorama(settings)
         inventory = discover_firewall_templates(panorama, firewall_name)
 
-        if template_number is None:
+        if template_number is None and spoke_template_name is None:
             _show_templates(inventory, "Spoke")
-        selected = _resolve_template(inventory, template_number, "Spoke")
-        hub_name = hub or typer.prompt("Hub firewall name")
+        selected = _resolve_template(
+            inventory, template_number, "Spoke", spoke_template_name
+        )
+        hub_name = hub or typer.prompt("Hub firewall hostname or serial number")
         hub_inventory = discover_firewall_templates(
             panorama,
             hub_name,
@@ -1388,12 +1489,13 @@ def build(
                 "The hub firewall must be different from the spoke firewall."
             )
 
-        if hub_template_number is None:
+        if hub_template_number is None and hub_template_name is None:
             _show_templates(hub_inventory, "Hub")
         hub_selected = _resolve_template(
             hub_inventory,
             hub_template_number,
             "Hub",
+            hub_template_name,
         )
         _heading("Selection")
         typer.echo(f"  Requested spoke: {inventory.firewall_name}")

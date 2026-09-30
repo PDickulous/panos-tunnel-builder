@@ -6,24 +6,29 @@ port = 443
 verify_ssl = true
 
 [build]
-firewall = "branch-01"
-template_number = 2
-hub = "hub-01"
-hub_template_number = 2
-vsys = "vsys1"
+spoke_firewall = "branch-01"
+# Use exact template names, or the menu-number alternatives below.
+spoke_template_name = "branch-network"
+hub_firewall = "hub-01"
+hub_template_name = "hub-network"
+# spoke_template_menu_number = 2
+# hub_template_menu_number = 2
+# Set a name OR a menu number for each endpoint, not both.
+spoke_vsys = "vsys1"
 hub_vsys = "vsys1"
 tunnel_address_pool = "10.254.0.0/24"
-snapshot_directory = "migration-snapshots"
+migration_artifact_directory = "migration-snapshots"
 show_secrets = false
 load_candidate = false
-allow_dirty_candidate = false
-yes = false
+allow_pending_candidate_changes = false
+# Accept confirmations and gateway mismatches; missing inputs still prompt.
+skip_confirmation = false
 
 [routes.snapshot]
 firewall = "branch-01"
-output = "branch-01-routes.json"
+output_file = "branch-01-routes.json"
 vsys = "vsys1"
-force = false
+overwrite_existing_file = false
 
 [routes.compare]
 before = "before.json"
@@ -33,9 +38,10 @@ interface_map = ["tunnel.2=tunnel.3"]
 next_hop_map = ["10.0.0.1=10.1.0.1"]
 
 [routes.verify-migration]
-manifest = "migration-validation.json"
+manifest_file = "migration-validation.json"
 output_directory = "migration-snapshots"
 
 [candidate.restore]
-snapshot = "LSVPN_PRE_example.xml"
-yes = false
+# Name of a saved configuration on Panorama, not a local file.
+snapshot_name = "LSVPN_PRE_example.xml"
+skip_confirmation = false

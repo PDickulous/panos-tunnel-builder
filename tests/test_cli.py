@@ -220,19 +220,17 @@ def test_build_uses_toml_command_defaults(
     config.write_text(
         """
 [build]
-firewall = "branch-01"
-template_number = 2
-hub = "hub-01"
-hub_template_number = 2
-yes = true
+spoke_firewall = "branch-01"
+spoke_template_menu_number = 2
+hub_firewall = "hub-01"
+hub_template_menu_number = 2
+skip_confirmation = true
 """,
         encoding="utf-8",
     )
     monkeypatch.setattr(cli, "load_settings", Mock(return_value=Mock()))
     monkeypatch.setattr(cli, "create_panorama", Mock(return_value=Mock()))
-    discovery = Mock(
-        side_effect=[_template_inventory(), _hub_template_inventory()]
-    )
+    discovery = Mock(side_effect=[_template_inventory(), _hub_template_inventory()])
     monkeypatch.setattr(cli, "discover_firewall_templates", discovery)
     monkeypatch.setattr(cli, "discover_lsvpn_satellites", Mock(return_value=()))
 
@@ -254,7 +252,7 @@ def test_command_line_value_overrides_toml_default(
     tmp_path: Path,
 ) -> None:
     config = tmp_path / "tunnels.toml"
-    config.write_text('[build]\nfirewall = "wrong-branch"\n', encoding="utf-8")
+    config.write_text('[build]\nspoke_firewall = "wrong-branch"\n', encoding="utf-8")
     monkeypatch.setattr(cli, "load_settings", Mock(return_value=Mock()))
     monkeypatch.setattr(cli, "create_panorama", Mock(return_value=Mock()))
     discovery = Mock(return_value=_template_inventory())
@@ -272,7 +270,7 @@ def test_command_line_value_overrides_toml_default(
 
 def test_config_file_error_is_reported(tmp_path: Path) -> None:
     config = tmp_path / "tunnels.toml"
-    config.write_text('[build]\nunknown = true\n', encoding="utf-8")
+    config.write_text("[build]\nunknown = true\n", encoding="utf-8")
 
     result = runner.invoke(cli.app, ["--config", str(config), "build"])
 
@@ -418,9 +416,9 @@ def test_build_prompts_for_hub_firewall(
     )
 
     assert result.exit_code == 0
-    assert "Hub firewall name: hub-01" in result.output
+    assert "Hub firewall hostname or serial number: hub-01" in result.output
     assert 'Hub firewall "hub-01" (998877)' in result.output
-    assert "Hub template number" in result.output
+    assert "Hub template menu number" in result.output
 
 
 def test_build_labels_initial_firewall_prompt_as_spoke(
@@ -437,7 +435,7 @@ def test_build_labels_initial_firewall_prompt_as_spoke(
     result = runner.invoke(cli.app, ["build"], input="branch-01\n0\n")
 
     assert result.exit_code == 1
-    assert "Spoke Firewall Name: branch-01" in result.output
+    assert "Spoke firewall hostname or serial number: branch-01" in result.output
 
 
 def test_build_rejects_spoke_as_hub(
@@ -496,9 +494,11 @@ def test_build_rejects_hub_stack_without_interface_template(
     assert "no templates containing interface configuration" in result.output
 
 
+@pytest.mark.parametrize("from_file", [False, True])
 def test_build_reports_lsvpn_clone_plan(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    from_file: bool,
 ) -> None:
     satellite = SatelliteConfig(
         name="legacy-satellite",
@@ -641,9 +641,27 @@ def test_build_reports_lsvpn_clone_plan(
     )
     monkeypatch.setattr(cli, "load_candidate_configuration", load_candidate)
 
+    if from_file:
+        config = tmp_path / "tunnels.toml"
+        config.write_text(
+            f'[build]\nmigration_artifact_directory = "{tmp_path}"\n'
+            "allow_pending_candidate_changes = true\n",
+            encoding="utf-8",
+        )
+        prefix = ["--config", str(config)]
+        artifact_flags: list[str] = []
+    else:
+        prefix = []
+        artifact_flags = [
+            "--migration-artifact-directory",
+            str(tmp_path),
+            "--allow-pending-candidate-changes",
+        ]
+
     result = runner.invoke(
         cli.app,
         [
+            *prefix,
             "build",
             "branch-01",
             "--template-number",
@@ -653,8 +671,7 @@ def test_build_reports_lsvpn_clone_plan(
             "--hub-template-number",
             "2",
             "--load-candidate",
-            "--snapshot-directory",
-            str(tmp_path),
+            *artifact_flags,
             "--yes",
         ],
         input="10.254.0.0/24\n",
@@ -683,6 +700,7 @@ def test_build_reports_lsvpn_clone_plan(
     assert "LSVPN_PRE_a1b2c_260819120000.xml" in manifests[0].read_text()
     assert "Post-check manifest:" in result.output
     assert discover_placements.call_count == 1
+    assert load_candidate.call_args.args[8] is True
     assert load_candidate.call_count == 1
     assert load_candidate.call_args.args[3][0].spoke.routing_object.name == "default"
     assert "SHA-256" in result.output
@@ -929,3 +947,201 @@ def test_build_rejects_removed_router_rename_option() -> None:
 
     assert result.exit_code == 2
     assert "No such option" in result.output
+
+
+@pytest.mark.parametrize(
+    ("setting", "flags", "should_load"),
+    [
+        ("true", [], True),
+        ("false", [], False),
+        ("true", ["--no-yes"], False),
+        ("false", ["--yes"], True),
+    ],
+)
+def test_restore_confirmation_defaults_and_cli_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    setting: str,
+    flags: list[str],
+    should_load: bool,
+) -> None:
+    config = tmp_path / "tunnels.toml"
+    config.write_text(
+        f'[candidate.restore]\nsnapshot_name = "saved.xml"\n'
+        f"skip_confirmation = {setting}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "load_settings", Mock())
+    monkeypatch.setattr(cli, "create_panorama", Mock())
+    load_snapshot = Mock()
+    monkeypatch.setattr(cli, "load_panorama_snapshot", load_snapshot)
+
+    result = runner.invoke(
+        cli.app,
+        ["--config", str(config), "candidate", "restore", *flags],
+        input="n\n",
+    )
+
+    assert result.exit_code == (0 if should_load else 1)
+    assert load_snapshot.call_count == int(should_load)
+
+
+@pytest.mark.parametrize(
+    ("defaults", "flags"),
+    [
+        (
+            "",
+            [
+                "--spoke-template-name",
+                "branch-network",
+                "--hub-template-name",
+                "hub-network",
+            ],
+        ),
+        (
+            'spoke_template_name = "branch-network"\nhub_template_name = "hub-network"',
+            [],
+        ),
+        (
+            "spoke_template_menu_number = 1\nhub_template_menu_number = 1",
+            [
+                "--spoke-template-name",
+                "branch-network",
+                "--hub-template-name",
+                "hub-network",
+            ],
+        ),
+        (
+            'spoke_template_name = "base"\nhub_template_name = "base"',
+            ["--spoke-template-menu-number", "2", "--hub-template-menu-number", "2"],
+        ),
+    ],
+)
+def test_build_selects_template_names_and_cli_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    defaults: str,
+    flags: list[str],
+) -> None:
+    config = tmp_path / "tunnels.toml"
+    config.write_text(
+        '[build]\nspoke_firewall = "branch-01"\nhub_firewall = "hub-01"\n'
+        'spoke_vsys = "vsys2"\nskip_confirmation = true\n' + defaults,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "load_settings", Mock())
+    monkeypatch.setattr(cli, "create_panorama", Mock())
+    discovery = Mock(side_effect=[_template_inventory(), _hub_template_inventory()])
+    monkeypatch.setattr(cli, "discover_firewall_templates", discovery)
+    satellites = Mock(return_value=())
+    monkeypatch.setattr(cli, "discover_lsvpn_satellites", satellites)
+
+    result = runner.invoke(cli.app, ["--config", str(config), "build", *flags])
+
+    assert result.exit_code == 0, result.output
+    assert 'Spoke template: "branch-network"' in result.output
+    assert 'Hub template: "hub-network"' in result.output
+    assert "templates in stack:" not in result.output
+    assert satellites.call_args.args[2] == "vsys2"
+
+
+@pytest.mark.parametrize("role", ["spoke", "hub"])
+@pytest.mark.parametrize("from_file", [True, False])
+def test_build_rejects_conflicting_template_selectors_before_connecting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    role: str,
+    from_file: bool,
+) -> None:
+    connect = Mock()
+    monkeypatch.setattr(cli, "create_panorama", connect)
+    if from_file:
+        config = tmp_path / "tunnels.toml"
+        config.write_text(
+            f'[build]\n{role}_template_name = "network"\n'
+            f"{role}_template_menu_number = 2\n",
+            encoding="utf-8",
+        )
+        args = ["--config", str(config), "build"]
+    else:
+        args = [
+            "build",
+            f"--{role}-template-name",
+            "network",
+            f"--{role}-template-menu-number",
+            "2",
+        ]
+
+    result = runner.invoke(cli.app, args)
+
+    assert result.exit_code == 2
+    assert f"Choose one {role} template selector" in result.output
+    connect.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("name", "message"),
+    [
+        ("missing", "Available names"),
+        ("BRANCH-NETWORK", "Available names"),
+        ("base", "does not contain interface configuration"),
+    ],
+)
+def test_template_name_rejects_unknown_or_ineligible_template(
+    name: str, message: str
+) -> None:
+    with pytest.raises(cli.DiscoveryError, match=message):
+        cli._resolve_template(_template_inventory(), None, "Spoke", name)
+
+
+def test_template_name_selection_is_independent_of_menu_order() -> None:
+    inventory = _template_inventory()
+    reordered = FirewallTemplateInventory(
+        firewall_name=inventory.firewall_name,
+        serial=inventory.serial,
+        stack_name=inventory.stack_name,
+        templates=tuple(reversed(inventory.templates)),
+    )
+
+    selected = cli._resolve_template(reordered, None, "Spoke", "branch-network")
+
+    assert selected.name == "branch-network"
+
+
+@pytest.mark.parametrize(
+    ("overwrite", "flags", "should_write"),
+    [
+        ("true", [], True),
+        ("false", ["--overwrite-existing-file"], True),
+        ("true", ["--no-overwrite-existing-file"], False),
+    ],
+)
+def test_snapshot_explicit_overwrite_setting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    overwrite: str,
+    flags: list[str],
+    should_write: bool,
+) -> None:
+    destination = tmp_path / "routes.json"
+    destination.write_text("original", encoding="utf-8")
+    config = tmp_path / "tunnels.toml"
+    config.write_text(
+        '[routes.snapshot]\nfirewall = "branch-01"\n'
+        f'output_file = "{destination}"\noverwrite_existing_file = {overwrite}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "load_settings", Mock())
+    monkeypatch.setattr(cli, "create_panorama", Mock())
+    monkeypatch.setattr(cli, "discover_managed_firewall", Mock())
+    snapshot = Mock(routes=(), to_json=Mock(return_value="replacement"))
+    capture = Mock(return_value=snapshot)
+    monkeypatch.setattr(cli, "capture_route_snapshot", capture)
+
+    result = runner.invoke(
+        cli.app, ["--config", str(config), "routes", "snapshot", *flags]
+    )
+
+    assert result.exit_code == (0 if should_write else 1), result.output
+    assert destination.read_text() == ("replacement" if should_write else "original")
+    assert capture.call_count == int(should_write)

@@ -213,7 +213,7 @@ The default workflow performs Panorama discovery and generates a local preview.
 With the explicit `--load-candidate` option, the tool acquires a temporary
 Panorama configuration lock and first verifies that candidate configuration
 matches running configuration. A dirty candidate is rejected by default because
-the failure rollback is global. The explicit `--allow-dirty-candidate` option
+the failure rollback is global. The explicit `--allow-pending-candidate-changes` option
 bypasses that protection with a warning. A clean-candidate run saves a
 timestamped `LSVPN_PRE_<id>_<timestamp>.xml` Panorama snapshot; an explicitly
 allowed dirty-candidate run labels it `LSVPN_CHK_<id>_<timestamp>.xml` to make

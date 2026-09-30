@@ -25,8 +25,8 @@ port = 8443
 verify_ssl = false
 
 [build]
-firewall = "branch-01"
-hub = "hub-01"
+spoke_firewall = "branch-01"
+hub_firewall = "hub-01"
 """,
         encoding="utf-8",
     )
@@ -128,4 +128,16 @@ def test_rejects_removed_router_rename_setting(tmp_path: Path) -> None:
     config.write_text('[build]\nvirtual_router_name = "branch-vr"\n', encoding="utf-8")
 
     with pytest.raises(ConfigurationFileError, match="virtual_router_name"):
+        configure_from_file(config)
+
+
+@pytest.mark.parametrize("section", ["build", "candidate.restore"])
+@pytest.mark.parametrize("setting", ["yes = false", 'skip_confirmation = "false"'])
+def test_rejects_invalid_confirmation_setting(
+    tmp_path: Path, section: str, setting: str
+) -> None:
+    config = tmp_path / "tunnels.toml"
+    config.write_text(f"[{section}]\n{setting}\n", encoding="utf-8")
+
+    with pytest.raises(ConfigurationFileError):
         configure_from_file(config)

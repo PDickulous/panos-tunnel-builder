@@ -612,8 +612,10 @@ def test_compare_cli_returns_failure_for_route_drift(tmp_path: Path) -> None:
     assert "1 missing, 0 added, 0 changed" in result.output
 
 
+@pytest.mark.parametrize("from_file", [False, True])
 def test_verify_migration_cli_captures_and_compares_post_routes(
     tmp_path: Path,
+    from_file: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     before = replace(_snapshot(_route()), bgp_peer_count=2)
@@ -656,9 +658,19 @@ def test_verify_migration_cli_captures_and_compares_post_routes(
     )
     monkeypatch.setattr(cli, "capture_route_snapshot", capture)
 
+    if from_file:
+        config = tmp_path / "tunnels.toml"
+        config.write_text(
+            f'[routes.verify-migration]\nmanifest_file = "{manifest_path}"\n',
+            encoding="utf-8",
+        )
+        args = ["--config", str(config), "routes", "verify-migration"]
+    else:
+        args = ["routes", "verify-migration", str(manifest_path)]
+
     result = runner.invoke(
         cli.app,
-        ["routes", "verify-migration", str(manifest_path)],
+        args,
     )
 
     assert result.exit_code == 0
@@ -672,7 +684,7 @@ def test_verify_migration_cli_captures_and_compares_post_routes(
     )
     mismatch = runner.invoke(
         cli.app,
-        ["routes", "verify-migration", str(manifest_path)],
+        args,
     )
 
     assert mismatch.exit_code == 1
