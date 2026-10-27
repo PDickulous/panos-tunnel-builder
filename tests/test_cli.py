@@ -1,3 +1,4 @@
+import re
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import Mock
@@ -84,13 +85,21 @@ def _tunnel_inventories() -> tuple[
     return TunnelInterfaceInventory((spoke,)), TunnelInterfaceInventory((hub,))
 
 
-def test_help_lists_status_command() -> None:
+@pytest.mark.parametrize("force_color", [False, True])
+def test_help_lists_status_command(
+    monkeypatch: pytest.MonkeyPatch, force_color: bool
+) -> None:
+    if force_color:
+        monkeypatch.setenv("FORCE_COLOR", "1")
+    else:
+        monkeypatch.delenv("FORCE_COLOR", raising=False)
     result = runner.invoke(cli.app, ["--help"])
+    output = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
 
     assert result.exit_code == 0
-    assert "status" in result.output
-    assert "--config" in result.output
-    assert "Interactively build and manage PAN-OS IPsec tunnels" in result.output
+    assert "status" in output
+    assert "--config" in output
+    assert "Interactively build and manage PAN-OS IPsec tunnels" in output
 
 
 def test_status_reports_success(monkeypatch: pytest.MonkeyPatch) -> None:
