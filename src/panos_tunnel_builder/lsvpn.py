@@ -10,7 +10,6 @@ from typing import Literal, Protocol, cast
 
 from panos.device import Vsys
 from panos.errors import PanDeviceError, PanNoSuchNode
-from panos.firewall import Firewall
 from panos.network import (
     Bgp,
     BgpPeer,
@@ -38,6 +37,8 @@ from panos.network import (
     Zone,
 )
 from panos.panorama import Panorama, Template
+
+from .panorama_client import Firewall
 
 DEFAULT_VSYS = "vsys1"
 PORTAL_XPATH = (

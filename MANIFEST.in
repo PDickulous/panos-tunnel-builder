@@ -1,0 +1,6 @@
+include README.md README-pypi.md LICENSE CONTRIBUTING.md main.py requirements.txt
+include .env.example panos-tunnel-builder.example.toml
+include .github/workflows/ci.yml
+include scripts/check_distributions.py
+include docs/architecture.md docs/configuration.md docs/roadmap.md
+include docs/usage.md docs/validation.md

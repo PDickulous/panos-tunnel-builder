@@ -1,4 +1,5 @@
 import json
+import os
 import xml.etree.ElementTree as ET
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -25,12 +26,15 @@ runner = CliRunner()
 
 def _snapshot(*routes: RouteEntry, serial: str = "001122") -> RouteSnapshot:
     return RouteSnapshot(
-        schema_version=1,
+        schema_version=2,
         firewall_name="branch-01",
         serial=serial,
         vsys="vsys1",
         captured_at="2026-08-19T12:00:00+00:00",
         routes=routes,
+        captured_routing_instances=(
+            RoutingInstanceConfig("logical-router", "MainLR", "default"),
+        ),
     )
 
 
@@ -85,7 +89,8 @@ def test_parse_advanced_routes_normalizes_vrf_and_multipath() -> None:
         }
     }
     response = ET.fromstring(
-        f"<response><result><json>{json.dumps(payload)}</json></result></response>"
+        f'<response status="success"><result><json>{json.dumps(payload)}</json>'
+        "</result></response>"
     )
 
     routes = route_validation._parse_advanced_routes(response, "MainLR")
@@ -112,7 +117,7 @@ def test_parse_advanced_routes_normalizes_vrf_and_multipath() -> None:
 def test_parse_legacy_routes_uses_flags_for_protocol_and_active_state() -> None:
     response = ET.fromstring(
         """
-        <response><result>
+        <response status="success"><result>
           <entry>
             <virtual-router>default</virtual-router>
             <destination>10.10.0.1/16</destination>
@@ -165,7 +170,7 @@ def test_parse_all_documented_legacy_route_flags(
 ) -> None:
     response = ET.fromstring(
         f"""
-        <response><result><entry>
+        <response status="success"><result><entry>
           <virtual-router>default</virtual-router>
           <destination>10.0.0.0/8</destination>
           <nexthop>192.0.2.2</nexthop>
@@ -191,9 +196,9 @@ def test_snapshot_json_round_trip() -> None:
 
 
 def test_snapshot_rejects_unknown_schema() -> None:
-    value = _snapshot().to_json().replace('"schema_version": 1', '"schema_version": 2')
+    value = _snapshot().to_json().replace('"schema_version": 2', '"schema_version": 3')
 
-    with pytest.raises(RouteValidationError, match="schema version 2"):
+    with pytest.raises(RouteValidationError, match="schema version 3"):
         RouteSnapshot.from_json(value)
 
 
@@ -525,7 +530,8 @@ def test_capture_queries_logical_router_once_for_multiple_vrfs(
     panorama = Mock()
     op = Mock(
         return_value=ET.fromstring(
-            '<response><result><json>{"MainLR": {}}</json></result></response>'
+            '<response status="success"><result><json>{"MainLR": {}}</json>'
+            "</result></response>"
         )
     )
     discover = Mock(
@@ -613,9 +619,11 @@ def test_compare_cli_returns_failure_for_route_drift(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("from_file", [False, True])
+@pytest.mark.parametrize("firewall_name", ["branch-01", "branch/../../../outside"])
 def test_verify_migration_cli_captures_and_compares_post_routes(
     tmp_path: Path,
     from_file: bool,
+    firewall_name: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     before = replace(_snapshot(_route()), bgp_peer_count=2)
@@ -628,7 +636,7 @@ def test_verify_migration_cli_captures_and_compares_post_routes(
         endpoints=(
             MigrationEndpointValidation(
                 role="spoke",
-                firewall_name="branch-01",
+                firewall_name=firewall_name,
                 serial="001122",
                 vsys="vsys1",
                 baseline_snapshot=baseline.name,
@@ -676,7 +684,10 @@ def test_verify_migration_cli_captures_and_compares_post_routes(
     assert result.exit_code == 0
     assert "Configured BGP peers: pre=2, post=2" in result.output
     assert "Migration route verification passed" in result.output
-    assert len(tuple(tmp_path.glob("LSVPN_POST_MIGRATION_*_routes.json"))) == 1
+    outputs = tuple(tmp_path.glob("LSVPN_POST_MIGRATION_*_routes.json"))
+    assert len(outputs) == 1
+    if os.name == "posix":
+        assert outputs[0].stat().st_mode & 0o777 == 0o600
 
     baseline.write_text(
         replace(before, bgp_peer_count=3).to_json(),

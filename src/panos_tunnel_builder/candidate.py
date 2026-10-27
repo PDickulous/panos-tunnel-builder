@@ -5,7 +5,7 @@ import xml.etree.ElementTree as ET
 from collections import Counter
 from collections.abc import Callable
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import cast
 
@@ -55,6 +55,21 @@ RoutingScopeFingerprint = tuple[tuple[str, tuple[object, ...]], ...]
 class CandidateLoadError(LsvpnConfigurationError):
     """Candidate loading failed, with automatic rollback status included."""
 
+    lock_cleanup_error: str | None = None
+
+
+class CandidateLoadInterrupted(CandidateLoadError):
+    """Candidate loading was cancelled, with automatic rollback status included."""
+
+
+class CandidateRestoreError(LsvpnConfigurationError):
+    """Snapshot restore failed, including checkpoint recovery and lock status."""
+
+    def __init__(self, message: str, *, interrupted: bool = False) -> None:
+        super().__init__(message)
+        self.interrupted = interrupted
+        self.lock_cleanup_error: str | None = None
+
 
 @dataclass(frozen=True)
 class EndpointTemplatePlacement:
@@ -79,6 +94,22 @@ class CandidateLoadResult:
     panorama_snapshot_name: str
     created_or_updated_objects: int
     removed_satellite_objects: int
+    lock_cleanup_error: str | None = None
+
+
+@dataclass(frozen=True)
+class CandidateRestoreResult:
+    snapshot_name: str
+    checkpoint_name: str
+    lock_cleanup_error: str | None = None
+
+
+@dataclass
+class _CandidateLocks:
+    """Only successful acquisitions in this invocation authorize release."""
+
+    configuration: bool = False
+    commit: bool = False
 
 
 @dataclass(frozen=True)
@@ -843,18 +874,115 @@ def save_pre_migration_snapshot(
     return filename
 
 
-def load_panorama_snapshot(panorama: Panorama, filename: str) -> None:
-    """Load a named Panorama snapshot into candidate configuration only."""
+def _validate_snapshot_name(filename: str) -> None:
     if len(filename) > 32 or not re.fullmatch(r"[A-Za-z0-9_.-]+\.xml", filename):
         raise LsvpnConfigurationError(
             "Panorama snapshot names may contain only letters, numbers, dot, "
             "underscore, and hyphen, must end in .xml, and can be at most "
             "32 characters."
         )
+
+
+def load_panorama_snapshot(panorama: Panorama, filename: str) -> None:
+    """Low-level snapshot load; callers own locking and recovery policy."""
+    _validate_snapshot_name(filename)
     command = ET.Element("load")
     config = ET.SubElement(command, "config")
     ET.SubElement(config, "from").text = filename
     panorama.op(cmd=ET.tostring(command, encoding="utf-8"), cmd_xml=False)
+
+
+def _restore_candidate_locked(
+    panorama: Panorama,
+    filename: str,
+    on_checkpoint_saved: Callable[[str], None] | None,
+) -> CandidateRestoreResult:
+    try:
+        checkpoint = save_pre_migration_snapshot(
+            panorama, f"restore:{filename}", checkpoint=True
+        )
+    except (Exception, KeyboardInterrupt, SystemExit) as exc:
+        raise CandidateRestoreError(
+            "Cannot save the pre-restore checkpoint: "
+            f"{type(exc).__name__}: {exc}. Candidate replacement was not attempted.",
+            interrupted=isinstance(exc, (KeyboardInterrupt, SystemExit)),
+        ) from exc
+    try:
+        if on_checkpoint_saved is not None:
+            on_checkpoint_saved(checkpoint)
+    except (Exception, KeyboardInterrupt, SystemExit) as exc:
+        raise CandidateRestoreError(
+            f'Pre-restore checkpoint "{checkpoint}" was saved, but restore '
+            f"was not attempted: {type(exc).__name__}: {exc}.",
+            interrupted=isinstance(exc, (KeyboardInterrupt, SystemExit)),
+        ) from exc
+    try:
+        load_panorama_snapshot(panorama, filename)
+    except (Exception, KeyboardInterrupt, SystemExit) as restore_error:
+        interrupted = isinstance(restore_error, (KeyboardInterrupt, SystemExit))
+        reason = (
+            f'Restore of "{filename}" failed: '
+            f"{type(restore_error).__name__}: {restore_error}. "
+        )
+        try:
+            # Preserve pending work from before restore, rather than reverting
+            # the whole candidate to running configuration.
+            load_panorama_snapshot(panorama, checkpoint)
+        except (Exception, KeyboardInterrupt, SystemExit) as recovery_error:
+            raise CandidateRestoreError(
+                reason + "Checkpoint recovery also failed: "
+                f"{type(recovery_error).__name__}: {recovery_error}. "
+                "Panorama candidate configuration may contain partial changes. "
+                f'Pre-restore checkpoint "{checkpoint}" remains available for '
+                "manual recovery. No commit or push was issued.",
+                interrupted=interrupted
+                or isinstance(recovery_error, (KeyboardInterrupt, SystemExit)),
+            ) from restore_error
+        raise CandidateRestoreError(
+            reason + f'Pre-restore checkpoint "{checkpoint}" was reloaded into '
+            "candidate configuration, preserving the candidate saved before "
+            "restore, including pending changes. No commit or push was issued.",
+            interrupted=interrupted,
+        ) from restore_error
+    return CandidateRestoreResult(filename, checkpoint)
+
+
+def restore_candidate_configuration(
+    panorama: Panorama,
+    filename: str,
+    *,
+    on_checkpoint_saved: Callable[[str], None] | None = None,
+) -> CandidateRestoreResult:
+    """Replace the candidate under configuration/commit locks and checkpoint it."""
+    _validate_snapshot_name(filename)
+    locks = _CandidateLocks()
+    protected = False
+    try:
+        _acquire_candidate_locks(
+            panorama, locks, f"panos-tunnel-builder snapshot restore: {filename}"
+        )
+        protected = True
+        result = _restore_candidate_locked(panorama, filename, on_checkpoint_saved)
+    except (Exception, KeyboardInterrupt, SystemExit) as exc:
+        cleanup_error = _release_candidate_locks(panorama, locks)
+        if isinstance(exc, CandidateRestoreError):
+            exc.lock_cleanup_error = cleanup_error
+            raise
+        error = CandidateRestoreError(
+            (
+                "Restore did not report a completed outcome: "
+                f"{type(exc).__name__}: {exc}. Inspect candidate configuration and "
+                "any reported pre-restore checkpoint before retrying."
+                if protected
+                else f"Candidate protection failed: {type(exc).__name__}: {exc}. "
+                "Restore was not attempted; inspect Panorama jobs and lock "
+                "ownership before retrying."
+            ),
+            interrupted=isinstance(exc, (KeyboardInterrupt, SystemExit)),
+        )
+        error.lock_cleanup_error = cleanup_error
+        raise error from exc
+    return replace(result, lock_cleanup_error=_release_candidate_locks(panorama, locks))
 
 
 def rollback_candidate_configuration(panorama: Panorama) -> None:
@@ -989,6 +1117,78 @@ def _response_config(response: ET.Element) -> ET.Element | None:
         return response
     direct = response.find("./result/config")
     return direct if direct is not None else response.find(".//config")
+
+
+@dataclass(frozen=True)
+class SourceConfigurationFingerprint:
+    """In-memory source evidence captured before discovery, without raw secrets."""
+
+    serial: str | None
+    candidate: str
+    running: str
+    effective_running: str | None = None
+
+
+def _source_config_digest(response: object, label: str) -> str:
+    if (
+        not isinstance(response, ET.Element)
+        or response.tag not in {"response", "config"}
+        or (response.tag == "response" and response.get("status") != "success")
+    ):
+        raise LsvpnConfigurationError(
+            f"Cannot verify {label}: configuration response was not successful."
+        )
+    # Accept only the expected full-config envelope, not a nested partial tree.
+    config = response if response.tag == "config" else response.find("./result/config")
+    if config is None or not len(config):
+        raise LsvpnConfigurationError(
+            f"Cannot verify {label}: full configuration was not returned."
+        )
+    return hashlib.sha256(repr(_canonical_xml(config)).encode()).hexdigest()
+
+
+def capture_source_configuration(
+    panorama: Panorama, serial: str | None = None
+) -> SourceConfigurationFingerprint:
+    """Fingerprint full configuration before reading any plan inputs from it."""
+    label = f"firewall {serial}" if serial else "Panorama"
+    options = {"extra_qs": {"target": serial}} if serial else {}
+    candidate = _source_config_digest(
+        panorama.xapi.get("/config", **options), f"{label} candidate"
+    )
+    running = _source_config_digest(
+        panorama.xapi.show("/config", **options), f"{label} running"
+    )
+    effective = None
+    if serial:
+        effective = _source_config_digest(
+            panorama.op(
+                cmd=b"<show><config><effective-running /></config></show>",
+                cmd_xml=False,
+                extra_qs={"target": serial},
+            ),
+            f"{label} effective running",
+        )
+    return SourceConfigurationFingerprint(serial, candidate, running, effective)
+
+
+def assert_source_configuration_unchanged(
+    panorama: Panorama,
+    expected: tuple[SourceConfigurationFingerprint, ...],
+) -> None:
+    """Check the reviewed source under both locks, before snapshot or mutation."""
+    if not expected or expected[0].serial is not None:
+        raise LsvpnConfigurationError(
+            "A pre-discovery Panorama source fingerprint is required for loading."
+        )
+    for source in expected:
+        if capture_source_configuration(panorama, source.serial) != source:
+            label = f"firewall {source.serial}" if source.serial else "Panorama"
+            raise LsvpnConfigurationError(
+                f"Source configuration changed on {label} since discovery. "
+                "Candidate loading was not attempted; rebuild and review a fresh "
+                "plan and route baselines before retrying."
+            )
 
 
 def assert_clean_candidate_configuration(panorama: Panorama) -> None:
@@ -1825,6 +2025,7 @@ def _load_candidate_configuration_locked(
     hub_vsys: str = DEFAULT_VSYS,
     variables: CandidateVariableSet | None = None,
     allow_dirty_candidate: bool = False,
+    on_snapshot_saved: Callable[[str], None] | None = None,
 ) -> CandidateLoadResult:
     """Save a rollback snapshot and load replacement objects without a commit."""
     if not (len(plans) == len(replacements) == len(placements)):
@@ -1875,6 +2076,8 @@ def _load_candidate_configuration_locked(
         spoke_name,
         checkpoint=allow_dirty_candidate,
     )
+    if on_snapshot_saved is not None:
+        on_snapshot_saved(snapshot_name)
     try:
         written = 0
         removed = 0
@@ -1938,22 +2141,100 @@ def _load_candidate_configuration_locked(
             tuple(removed_legacy_route_paths),
             variable_set,
         )
-    except Exception as load_error:
+    except (Exception, KeyboardInterrupt, SystemExit) as load_error:
+        interrupted = isinstance(load_error, (KeyboardInterrupt, SystemExit))
+        error_type = CandidateLoadInterrupted if interrupted else CandidateLoadError
+        reason = (
+            f"Candidate loading interrupted ({type(load_error).__name__})"
+            if interrupted
+            else f"Candidate loading failed: {load_error}"
+        )
         try:
             rollback_candidate_configuration(panorama)
-        except Exception as rollback_error:
-            raise CandidateLoadError(
-                f"Candidate loading failed: {load_error}. Automatic candidate "
-                f"rollback also failed: {rollback_error}. Panorama candidate "
-                "configuration may contain partial migration changes. The saved "
+        except (Exception, KeyboardInterrupt, SystemExit) as rollback_error:
+            raise error_type(
+                f"{reason}. Automatic candidate rollback also failed: "
+                f"{type(rollback_error).__name__}: {rollback_error}. "
+                "Panorama candidate configuration may contain partial migration "
+                "changes. The saved "
                 f'snapshot "{snapshot_name}" was not loaded.'
             ) from load_error
-        raise CandidateLoadError(
-            f"Candidate loading failed: {load_error}. Panorama candidate changes "
+        raise error_type(
+            f"{reason}. Panorama candidate changes "
             "were rolled back to running configuration; no commit or push was "
             f'issued. The saved snapshot "{snapshot_name}" was not loaded.'
         ) from load_error
     return CandidateLoadResult(snapshot_name, written, removed)
+
+
+def _assert_no_unfinished_jobs(panorama: Panorama) -> None:
+    """A new commit lock does not cancel work that was already accepted."""
+    response = panorama.op(cmd=b"<show><jobs><all /></jobs></show>", cmd_xml=False)
+    if (
+        not isinstance(response, ET.Element)
+        or response.tag != "response"
+        or response.get("status") != "success"
+        or (result := response.find("./result")) is None
+    ):
+        raise LsvpnConfigurationError("Panorama job status could not be verified")
+    if (result.text or "").strip() or any(child.tag != "job" for child in result):
+        raise LsvpnConfigurationError("Panorama returned an unrecognized job listing")
+    pending: list[str] = []
+    for job in result:
+        identifier = (job.findtext("id") or "").strip()
+        kind = (job.findtext("type") or "").strip()
+        status = (job.findtext("status") or "").strip().upper()
+        if not identifier or not kind or not status:
+            raise LsvpnConfigurationError("Panorama returned an incomplete job record")
+        # Do not guess that an unknown or newly introduced job type is harmless.
+        if status != "FIN":
+            pending.append(f"{identifier} ({kind}, {status})")
+    if pending:
+        raise LsvpnConfigurationError(
+            "Panorama has unfinished jobs: "
+            + ", ".join(pending)
+            + ". Wait for completion and retry; no jobs were cancelled"
+        )
+
+
+def _acquire_candidate_locks(
+    panorama: Panorama,
+    locks: _CandidateLocks,
+    comment: str,
+) -> None:
+    # Keep acquisition/release on the same Panorama transport. An HA failover
+    # must not silently split lock ownership across two appliances.
+    if not panorama.add_config_lock(
+        comment=comment, scope="shared", retry_on_peer=False
+    ):
+        raise LsvpnConfigurationError("Configuration lock was not acquired")
+    locks.configuration = True
+    if not panorama.add_commit_lock(
+        comment=comment, scope="shared", retry_on_peer=False
+    ):
+        raise LsvpnConfigurationError("Commit lock was not acquired")
+    locks.commit = True
+    _assert_no_unfinished_jobs(panorama)
+
+
+def _release_candidate_locks(
+    panorama: Panorama,
+    locks: _CandidateLocks,
+) -> str | None:
+    errors: list[str] = []
+    # Keep commit exclusion until configuration-lock cleanup has been attempted.
+    for label, owned, release in (
+        ("configuration", locks.configuration, panorama.remove_config_lock),
+        ("commit", locks.commit, panorama.remove_commit_lock),
+    ):
+        if not owned:
+            continue
+        try:
+            if release(scope="shared", retry_on_peer=False) is False:
+                raise RuntimeError("lock release was not confirmed")
+        except (Exception, KeyboardInterrupt, SystemExit) as exc:
+            errors.append(f"{label} lock: {type(exc).__name__}: {exc}")
+    return "; ".join(errors) or None
 
 
 def load_candidate_configuration(
@@ -1966,13 +2247,20 @@ def load_candidate_configuration(
     hub_vsys: str = DEFAULT_VSYS,
     variables: CandidateVariableSet | None = None,
     allow_dirty_candidate: bool = False,
+    on_snapshot_saved: Callable[[str], None] | None = None,
+    *,
+    source_configuration: tuple[SourceConfigurationFingerprint, ...],
 ) -> CandidateLoadResult:
-    """Load candidate changes under a temporary Panorama configuration lock."""
-    acquired = panorama.add_config_lock(
-        comment=f"panos-tunnel-builder LSVPN migration for {spoke_name}"
-    )
+    """Load under temporary configuration and commit locks after checking jobs."""
+    locks = _CandidateLocks()
+    protected = False
     try:
-        return _load_candidate_configuration_locked(
+        _acquire_candidate_locks(
+            panorama, locks, f"panos-tunnel-builder LSVPN migration for {spoke_name}"
+        )
+        protected = True
+        assert_source_configuration_unchanged(panorama, source_configuration)
+        result = _load_candidate_configuration_locked(
             panorama,
             spoke_name,
             plans,
@@ -1982,7 +2270,40 @@ def load_candidate_configuration(
             hub_vsys,
             variables,
             allow_dirty_candidate,
+            on_snapshot_saved,
         )
-    finally:
-        if acquired:
-            panorama.remove_config_lock()
+    except (Exception, KeyboardInterrupt, SystemExit) as load_error:
+        cleanup_error = _release_candidate_locks(panorama, locks)
+        if not protected:
+            error_type = (
+                CandidateLoadInterrupted
+                if isinstance(load_error, (KeyboardInterrupt, SystemExit))
+                else CandidateLoadError
+            )
+            error = error_type(
+                "Candidate protection failed: "
+                f"{type(load_error).__name__}: {load_error}. Candidate loading "
+                "was not attempted; inspect Panorama jobs and lock ownership "
+                "before retrying."
+            )
+            error.lock_cleanup_error = cleanup_error
+            raise error from load_error
+        if cleanup_error:
+            if isinstance(load_error, CandidateLoadError):
+                # Preserve the transaction/rollback failure as the primary error.
+                load_error.lock_cleanup_error = cleanup_error
+            else:
+                error_type = (
+                    CandidateLoadInterrupted
+                    if isinstance(load_error, (KeyboardInterrupt, SystemExit))
+                    else CandidateLoadError
+                )
+                error = error_type(
+                    "Candidate loading did not return a verified result: "
+                    f"{type(load_error).__name__}: {load_error}. "
+                    "Inspect Panorama candidate configuration before retrying."
+                )
+                error.lock_cleanup_error = cleanup_error
+                raise error from load_error
+        raise
+    return replace(result, lock_cleanup_error=_release_candidate_locks(panorama, locks))

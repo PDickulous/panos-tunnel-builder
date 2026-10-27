@@ -26,8 +26,21 @@ pyright
 ```
 
 Tests use mocks and XML fixtures and do not require a live Panorama connection.
+TLS tests also require the `openssl` executable to generate temporary test
+certificates; handshakes run in memory without opening network sockets.
 For a coverage report, run `pytest --cov=panos_tunnel_builder --cov-report=term-missing`.
-To check packaging, run `python -m pip wheel --no-deps --wheel-dir dist .`.
+To build and check both release archives, use a clean output directory:
+
+```bash
+python -m build --outdir /tmp/panos-release-check
+python scripts/check_distributions.py /tmp/panos-release-check
+```
+
+The archive check verifies the operator guides, examples, local documentation
+links, package metadata, and absence of common credential and artifact paths.
+It does not scan file contents for secrets. Keep the package-index description
+in `README-pypi.md` in sync with the repository README and use absolute links
+there so they resolve outside the repository.
 
 Pyright/Pylance uses the local `.venv` and checks both `src` and `tests`; mypy
 checks `src`. Add regression coverage for behavioral changes, especially

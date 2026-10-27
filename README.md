@@ -20,8 +20,8 @@ python -m pip install .
 cp .env.example .env
 ```
 
-Edit `.env` to set `PANORAMA_HOST` and `PANORAMA_API_KEY`, then check connectivity
-and preview a migration:
+Edit `.env` in the working directory to set `PANORAMA_HOST` and
+`PANORAMA_API_KEY`, then check connectivity and preview a migration:
 
 ```bash
 panos-tunnel-builder status

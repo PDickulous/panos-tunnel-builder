@@ -23,7 +23,8 @@ firewall.
 
 ```mermaid
 flowchart TD
-    A[Operator runs build] --> B[Resolve spoke, hub, vsys, stacks, and templates]
+    A[Operator runs build] --> A0[For candidate loading: fingerprint Panorama before discovery]
+    A0 --> B[Resolve spoke, hub, vsys, stacks, and templates<br/>Fingerprint endpoints before reading their plan inputs]
     B --> C{LSVPN satellite found?}
     C -- No --> C1[Report successful no-op<br/>No Panorama changes]
     C -- Yes --> D[Find the candidate template that owns the satellite]
@@ -38,17 +39,20 @@ flowchart TD
     K -- No --> K1[End after local preview]
     K -- Yes --> L[Capture pre-change RIB and routing config<br/>for every spoke and the hub]
     L --> M[Discover exact source-owning template placement]
-    M --> N[Acquire Panorama configuration lock]
-    N --> O[Run all candidate preflight checks]
-    O -- Fail --> O1[Release lock<br/>Delete local route artifacts from failed attempt]
+    M --> M1[Prepare and serialize validation manifest]
+    M1 --> N[Acquire configuration and commit locks<br/>Check unfinished jobs]
+    N --> O[Recheck source fingerprints<br/>Run all candidate preflight checks]
+    O -- Fail --> O1[Release acquired locks<br/>Delete local route artifacts from failed attempt]
     O -- Pass --> P[Save PRE snapshot<br/>or CHK snapshot when dirty candidate is explicitly allowed]
     P --> Q[Write variables, replacement objects, routing,<br/>zone/import bindings, and remove spoke LSVPN bindings]
     Q --> R[Reread Panorama candidate configuration]
     R --> S{Post-write invariants pass?}
     S -- No --> T[Issue Panorama candidate rollback to running config]
-    T --> T1[Release lock and report failure<br/>Saved Panorama snapshot remains for manual recovery]
-    S -- Yes --> U[Release lock and write validation manifest]
-    U --> V[Candidate verified<br/>No commit or push issued]
+    T --> T1[Attempt both lock releases and report failure<br/>Retain snapshot and route baselines for recovery]
+    S -- Yes --> U[Attempt both lock releases and report verified candidate<br/>Publish validation manifest atomically]
+    U --> U1{Lock cleanup and manifest publication succeeded?}
+    U1 -- No --> U2[Exit nonzero with candidate still verified<br/>Report cleanup/artifact errors and retain recovery files]
+    U1 -- Yes --> V[Candidate verified<br/>No commit or push issued]
     V --> W[Operator reviews, commits, pushes,<br/>and waits for routing convergence]
     W --> Y[Run routes verify-migration MANIFEST]
     Y --> Z[Capture new RIB and routing config on every endpoint]
@@ -65,7 +69,9 @@ Primary orchestration: [`build()`](../src/panos_tunnel_builder/cli.py#L1330),
 
 ```mermaid
 flowchart LR
-    A[Config lock] --> B[Clean-candidate check]
+    A[Configuration and commit locks] --> A1[No unfinished jobs]
+    A1 --> A2[Source fingerprints unchanged since discovery]
+    A2 --> B[Clean-candidate check]
     B --> C[Variable ownership/type check]
     C --> D[Required-input check]
     D --> E[Old-interface dependency audit]
@@ -116,6 +122,7 @@ and
 | Protected routing scope | Normalizes candidate routing XML while excluding only the exact old/new interfaces and replaced static-route names. Everything else must remain identical. | Any unrelated VR/LR/VRF protocol change triggers rollback. | [`_routing_scope_fingerprint()`](../src/panos_tunnel_builder/candidate.py#L1098) | [`test_routing_scope_normalization_allows_only_tunnel_related_changes`](../tests/test_candidate.py#L1190), [`test_routing_scope_normalization_detects_global_protocol_change`](../tests/test_candidate.py#L1233) |
 | Automatic backout | Any exception after the saved snapshot invokes PAN-OS candidate rollback to running configuration. The saved snapshot is retained but is not automatically loaded. | Reports both the original and rollback errors if rollback itself fails. | [`rollback_candidate_configuration()`](../src/panos_tunnel_builder/candidate.py#L860), [`_load_candidate_configuration_locked()`](../src/panos_tunnel_builder/candidate.py#L1818) | [`test_candidate_write_failure_automatically_rolls_back_candidate`](../tests/test_candidate.py#L633), [`test_candidate_write_reports_automatic_rollback_failure`](../tests/test_candidate.py#L673) |
 | Post-commit RIB | Compares firewall serial/vsys, routing instance/VRF, normalized prefix, protocol, distance, metric, selected/installed state, and every ECMP path. Expected old-to-new tunnel path mappings and new connected/local link routes are narrowly recorded in the manifest. | Returns nonzero for missing routes, unrelated additions, or changed expected candidates. | [`compare_route_snapshots()`](../src/panos_tunnel_builder/route_validation.py#L832), [`_migration_endpoint_rules()`](../src/panos_tunnel_builder/cli.py#L326) | [`test_migration_compare_allows_new_link_routes_and_extra_candidates`](../tests/test_route_validation.py#L440), [`test_migration_compare_still_rejects_unrelated_added_route`](../tests/test_route_validation.py#L475) |
+| Route capture completeness | Requires recognized successful responses and valid observed records for every discovered router; records the instance coverage in version 2 snapshots. | Rejects unrecognized, incomplete, or malformed responses and comparisons with older snapshots or mismatched coverage. Version 1 baselines require independent manual verification after migration. | [`capture_route_snapshot()`](../src/panos_tunnel_builder/route_validation.py), [`compare_route_snapshots()`](../src/panos_tunnel_builder/route_validation.py) | [`test_route_completeness.py`](../tests/test_route_completeness.py) |
 | Post-commit config | Compares effective virtual-router and logical-router/VRF configuration after removing only manifest-approved interface, peer, OSPF, and exact static-route changes. | Returns nonzero for any other routing-configuration drift. | [`compare_routing_configurations()`](../src/panos_tunnel_builder/route_validation.py#L769) | [`test_routing_configuration_ignores_interface_member_order`](../tests/test_route_validation.py#L345), CLI verifier tests in [`test_route_validation.py`](../tests/test_route_validation.py) |
 
 ## Artifacts and audit trail
@@ -124,10 +131,42 @@ and
 |---|---|---:|---|
 | Terminal preview | Every plan | PSK only with explicit `--show-secrets` | Human review of scope, endpoints, naming, addressing, routing, and crypto. |
 | `LSVPN_PRE_*.xml` Panorama saved config | Clean candidate load | Yes, as protected Panorama configuration | Manual recovery point representing a clean pre-migration candidate. |
-| `LSVPN_CHK_*.xml` Panorama saved config | Dirty candidate load explicitly allowed | Yes, as protected Panorama configuration | Checkpoint containing pre-existing pending changes; not asserted to be a clean baseline. |
-| `LSVPN_PRE_MIGRATION_*_routes.json` | Before candidate load | No PSKs | Per-firewall RIB plus effective routing configuration baseline. |
-| `LSVPN_MIGRATION_*_validation.json` | Successful candidate verification | No PSKs | Binds endpoints and baseline files to the exact expected interface, next-hop, prefix, and routing-config exceptions. |
-| `LSVPN_POST_MIGRATION_*_routes.json` | `routes verify-migration` | No PSKs | Evidence captured after commit/push/convergence for comparison and troubleshooting. |
+| `LSVPN_CHK_*.xml` Panorama saved config | Dirty migration explicitly allowed, or before snapshot restore | Yes, as protected Panorama configuration | Checkpoint containing the current candidate, including pending changes; not asserted to be a clean baseline. |
+| `LSVPN_PRE_MIGRATION_*_routes.json` | Before candidate load | May include routing authentication material | Sensitive per-firewall RIB plus raw effective routing configuration baseline. |
+| `LSVPN_MIGRATION_*_validation.json` | Successful candidate verification | Sensitive identities/topology; no generated PSKs | Binds endpoints and baseline files to the exact expected interface, next-hop, prefix, and routing-config exceptions. |
+| `LSVPN_POST_MIGRATION_*_routes.json` | `routes verify-migration` | May include routing authentication material | Sensitive evidence captured after commit/push/convergence for comparison and troubleshooting. |
+
+All local snapshot and manifest writes use private staging files and atomic
+publication. On POSIX, file modes are `0600`; newly created artifact directories
+request `0700`. Existing directories and old captures are not modified. Retained
+manifest staging files use the same private file mode. Raw routing configuration
+is preserved for verification, not automatically redacted. See
+[artifact handling and sharing](usage.md#protecting-and-sharing-artifacts).
+
+Snapshot restore has a separate checkpoint recovery policy: both lock acquisitions, job check,
+checkpoint save, requested load, optional reload of the checkpoint on failure,
+then independent lock releases. Tests in `test_candidate.py` cover that API order, contention,
+checkpoint failure, pending-work preservation on load failure/interruption,
+failed recovery, and independent lock-cleanup reporting. CLI tests cover
+confirmation wording, checkpoint reporting, and nonzero/130 exit statuses. These
+checks use simulated API responses; live restore/recovery validation remains
+outstanding.
+
+Lock acquisition failures, unfinished or malformed job listings, interrupted
+acquisition, and independent cleanup failures are covered in
+[`test_candidate_locks.py`](../tests/test_candidate_locks.py). Only confirmed
+acquisitions authorize cleanup; commit protection remains through recovery.
+Live competing-administrator and queued-commit checks remain outstanding.
+
+Source-drift tests in
+[`test_source_configuration.py`](../tests/test_source_configuration.py) cover
+Panorama, hub, selected spoke, and additional shared spokes; changes to candidate,
+running, and effective-running configuration; and a committed change that leaves
+candidate and running equal. They verify rejection before snapshot or mutation,
+independent lock cleanup, failed/interrupted reads, and successful unchanged-source
+loading. Full configuration fingerprints stay in memory and are mandatory for
+the transaction entry point. CLI tests verify the pre-discovery captures are
+passed to the transaction.
 
 ## What the checks do not prove
 
@@ -136,6 +175,9 @@ and
   pushed yet.
 - The post-check does not wait for convergence. The operator must run it only
   after IKE/IPsec and routing have had time to settle.
+- Route capture checks known response shapes, observed records, and reported
+  counts; it cannot detect routes omitted by the device without a truncation
+  indicator. Verify supported response formats against each deployed release.
 - Route equivalence is evidence of control-plane equivalence, not an end-to-end
   application traffic test. A separate traffic validation is still appropriate.
 - Public FQDN matching depends on DNS answers available when discovery runs.

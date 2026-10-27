@@ -7,7 +7,6 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
-from panos.firewall import Firewall
 from panos.panorama import Panorama
 
 from .lsvpn import (
@@ -16,8 +15,10 @@ from .lsvpn import (
     _attach_to_panorama,
     _read_effective_running_config,
 )
+from .panorama_client import Firewall
 
-SCHEMA_VERSION = 1
+ROUTE_SNAPSHOT_SCHEMA_VERSION = 2
+MANIFEST_SCHEMA_VERSION = 1
 
 
 class RouteValidationError(RuntimeError):
@@ -66,6 +67,7 @@ class RouteSnapshot:
     routes: tuple[RouteEntry, ...]
     routing_configuration: tuple[str, ...] = ()
     bgp_peer_count: int | None = None
+    captured_routing_instances: tuple[RoutingInstanceConfig, ...] = ()
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, sort_keys=True) + "\n"
@@ -75,14 +77,22 @@ class RouteSnapshot:
         try:
             document = cast(dict[str, Any], json.loads(value))
             schema_version = int(document["schema_version"])
-            if schema_version != SCHEMA_VERSION:
+            if schema_version == 1:
+                raise RouteValidationError(
+                    "Route snapshot schema version 1 does not prove route capture "
+                    "completeness. Capture a fresh baseline before migration; "
+                    "if migration already occurred, retain the old evidence and "
+                    "verify the original baseline manually."
+                )
+            if schema_version != ROUTE_SNAPSHOT_SCHEMA_VERSION:
                 raise RouteValidationError(
                     f"Unsupported route snapshot schema version {schema_version}; "
-                    f"expected {SCHEMA_VERSION}."
+                    f"expected {ROUTE_SNAPSHOT_SCHEMA_VERSION}."
                 )
             routes_value = document["routes"]
             routing_configuration_value = document.get("routing_configuration", [])
             bgp_peer_count_value = document.get("bgp_peer_count")
+            instances_value = document.get("captured_routing_instances")
             if not isinstance(routes_value, list):
                 raise RouteValidationError("Snapshot routes must be a JSON array.")
             if not isinstance(routing_configuration_value, list) or not all(
@@ -100,7 +110,8 @@ class RouteSnapshot:
                     "Snapshot bgp_peer_count must be a non-negative integer."
                 )
             routes = tuple(_route_from_dict(item) for item in routes_value)
-            return cls(
+            instances = _captured_instances_from_json(instances_value)
+            snapshot = cls(
                 schema_version=schema_version,
                 firewall_name=str(document["firewall_name"]),
                 serial=str(document["serial"]),
@@ -109,7 +120,10 @@ class RouteSnapshot:
                 routes=routes,
                 routing_configuration=tuple(routing_configuration_value),
                 bgp_peer_count=bgp_peer_count_value,
+                captured_routing_instances=instances,
             )
+            _assert_snapshot_coverage(snapshot)
+            return snapshot
         except RouteValidationError:
             raise
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -173,10 +187,10 @@ class MigrationValidationManifest:
         try:
             document = cast(dict[str, Any], json.loads(value))
             schema_version = int(document["schema_version"])
-            if schema_version != SCHEMA_VERSION:
+            if schema_version != MANIFEST_SCHEMA_VERSION:
                 raise RouteValidationError(
                     f"Unsupported migration manifest schema version "
-                    f"{schema_version}; expected {SCHEMA_VERSION}."
+                    f"{schema_version}; expected {MANIFEST_SCHEMA_VERSION}."
                 )
             endpoint_values = document["endpoints"]
             if not isinstance(endpoint_values, list) or not endpoint_values:
@@ -238,6 +252,59 @@ def _migration_endpoint_from_dict(value: Any) -> MigrationEndpointValidation:
         mutable_routing_interfaces=tuple(mutable_interfaces),
         mutable_route_names=tuple(mutable_route_names),
     )
+
+
+def _captured_instances_from_json(value: Any) -> tuple[RoutingInstanceConfig, ...]:
+    if not isinstance(value, list) or not value:
+        raise RouteValidationError("Snapshot lacks captured routing instance evidence.")
+    instances: list[RoutingInstanceConfig] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise RouteValidationError("Invalid captured routing instance evidence.")
+        kind, name, vrf = item.get("kind"), item.get("name"), item.get("vrf")
+        if (
+            kind not in ("virtual-router", "logical-router")
+            or not isinstance(name, str)
+            or not name.strip()
+            or (vrf is not None and (not isinstance(vrf, str) or not vrf.strip()))
+            or (kind == "virtual-router" and vrf is not None)
+        ):
+            raise RouteValidationError("Invalid captured routing instance evidence.")
+        instances.append(RoutingInstanceConfig(kind, name, vrf))
+    if len(set(instances)) != len(instances):
+        raise RouteValidationError("Duplicate captured routing instance evidence.")
+    return tuple(instances)
+
+
+def _assert_snapshot_coverage(snapshot: RouteSnapshot) -> None:
+    if (
+        snapshot.schema_version != ROUTE_SNAPSHOT_SCHEMA_VERSION
+        or not snapshot.captured_routing_instances
+    ):
+        raise RouteValidationError(
+            "Route snapshot lacks verified routing-instance capture evidence. "
+            "Capture a fresh baseline before migration; if migration already "
+            "occurred, retain the old evidence and verify it manually."
+        )
+    captured = {
+        (instance.kind, instance.name.casefold(), (instance.vrf or "").casefold())
+        for instance in snapshot.captured_routing_instances
+    }
+    if len(captured) != len(snapshot.captured_routing_instances):
+        raise RouteValidationError("Duplicate captured routing instance evidence.")
+    for route in snapshot.routes:
+        scope = (
+            route.routing_kind,
+            route.routing_instance.casefold(),
+            (route.vrf or "").casefold(),
+        )
+        wildcard = (route.routing_kind, route.routing_instance.casefold(), "")
+        if scope not in captured and not (
+            route.routing_kind == "logical-router" and wildcard in captured
+        ):
+            raise RouteValidationError(
+                f'Route for router "{route.routing_instance}" has no capture evidence.'
+            )
 
 
 def _path_mapping_from_dict(value: Any) -> RoutePathMapping:
@@ -427,12 +494,15 @@ def capture_route_snapshot(
     _attach_to_panorama(firewall, panorama)
     routes: list[RouteEntry] = []
     queried_logical_routers: set[str] = set()
-    for routing in discover_routing_instances(
+    instances = discover_routing_instances(
         panorama,
         serial,
         vsys,
         effective=effective,
-    ):
+    )
+    if not instances:
+        raise RouteValidationError("No routing instances were available to capture.")
+    for routing in instances:
         if (
             routing.kind == "logical-router"
             and routing.name.casefold() in queried_logical_routers
@@ -448,8 +518,8 @@ def capture_route_snapshot(
         else:
             routes.extend(_parse_legacy_routes(response, routing.name))
     timestamp = captured_at or datetime.now(UTC)
-    return RouteSnapshot(
-        schema_version=SCHEMA_VERSION,
+    snapshot = RouteSnapshot(
+        schema_version=ROUTE_SNAPSHOT_SCHEMA_VERSION,
         firewall_name=firewall_name,
         serial=serial,
         vsys=vsys,
@@ -457,18 +527,81 @@ def capture_route_snapshot(
         routes=tuple(sorted(routes, key=_route_sort_key)),
         routing_configuration=_routing_configuration_entries(effective),
         bgp_peer_count=_configured_bgp_peer_count(effective),
+        captured_routing_instances=instances,
     )
+    _assert_snapshot_coverage(snapshot)
+    return snapshot
+
+
+def _route_result(response: ET.Element, router: str) -> ET.Element:
+    if (
+        not isinstance(response, ET.Element)
+        or response.tag != "response"
+        or response.get("status") != "success"
+        or len(response.findall("./result")) != 1
+    ):
+        raise RouteValidationError(f'Router "{router}" returned an invalid response.')
+    result = response.find("./result")
+    assert result is not None
+    if (result.text or "").strip() or any((item.tail or "").strip() for item in result):
+        raise RouteValidationError(f'Router "{router}" returned an unrecognized table.')
+    return result
+
+
+def _route_prefix(value: object, router: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise RouteValidationError(
+            f'Router "{router}" returned a route without a prefix.'
+        )
+    try:
+        return str(ipaddress.ip_network(value.strip(), strict=False))
+    except ValueError as exc:
+        raise RouteValidationError(
+            f'Router "{router}" returned an invalid route prefix: {value!r}.'
+        ) from exc
+
+
+def _route_optional_int(value: object, router: str, field: str) -> int | None:
+    parsed = _optional_int(value)
+    if value not in (None, "") and (isinstance(value, bool) or parsed is None):
+        raise RouteValidationError(f'Router "{router}" returned invalid {field}.')
+    if isinstance(value, float):
+        raise RouteValidationError(f'Router "{router}" returned invalid {field}.')
+    return parsed
+
+
+def _route_optional_bool(value: object, router: str, field: str) -> bool | None:
+    parsed = _optional_bool(value)
+    if value not in (None, "") and parsed is None:
+        raise RouteValidationError(f'Router "{router}" returned invalid {field}.')
+    return parsed
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise RouteValidationError("Route JSON contains duplicate object keys.")
+        result[key] = value
+    return result
 
 
 def _parse_advanced_routes(
     response: ET.Element,
     logical_router: str,
 ) -> tuple[RouteEntry, ...]:
-    json_text = response.findtext("./result/json")
+    result = _route_result(response, logical_router)
+    if len(result) != 1 or result[0].tag != "json" or len(result[0]):
+        raise RouteValidationError(
+            f'Logical router "{logical_router}" returned an unrecognized route table.'
+        )
+    json_text = result[0].text
     if not json_text or not json_text.strip():
-        return ()
+        raise RouteValidationError(
+            f'Logical router "{logical_router}" returned no route JSON.'
+        )
     try:
-        document = json.loads(json_text)
+        document = json.loads(json_text, object_pairs_hook=_unique_json_object)
     except json.JSONDecodeError as exc:
         raise RouteValidationError(
             f'Logical router "{logical_router}" returned invalid route JSON: {exc}'
@@ -478,44 +611,95 @@ def _parse_advanced_routes(
             f'Logical router "{logical_router}" returned an unexpected route result.'
         )
     router_routes = document.get(logical_router)
-    if router_routes is None and len(document) == 1:
-        router_routes = next(iter(document.values()))
     if not isinstance(router_routes, dict):
-        return ()
+        raise RouteValidationError(
+            f'Logical router "{logical_router}" is missing from the route result.'
+        )
     routes: list[RouteEntry] = []
     for reported_prefix, candidates in router_routes.items():
-        if not isinstance(candidates, list):
-            continue
+        prefix = _route_prefix(reported_prefix, logical_router)
+        if not isinstance(candidates, list) or not candidates:
+            raise RouteValidationError(
+                f'Logical router "{logical_router}" returned invalid route candidates.'
+            )
         for candidate in candidates:
             if not isinstance(candidate, dict):
-                continue
-            prefix = _normalize_prefix(str(candidate.get("prefix") or reported_prefix))
-            next_hops = candidate.get("nexthops")
-            paths = (
-                tuple(
-                    RoutePath(
-                        next_hop=_normalize_address(_optional_string(path.get("ip"))),
-                        interface=_optional_string(path.get("interfaceName")),
-                        weight=_optional_int(path.get("weight")),
-                        active=_optional_bool(path.get("active")),
-                    )
-                    for path in next_hops
-                    if isinstance(path, dict)
+                raise RouteValidationError(
+                    f'Logical router "{logical_router}" returned '
+                    "an invalid route record."
                 )
-                if isinstance(next_hops, list)
-                else ()
-            )
+            if (
+                "prefix" in candidate
+                and _route_prefix(candidate["prefix"], logical_router) != prefix
+            ):
+                raise RouteValidationError(
+                    f'Logical router "{logical_router}" returned '
+                    "a conflicting route prefix."
+                )
+            protocol, vrf = candidate.get("protocol"), candidate.get("vrfName")
+            if (
+                not isinstance(protocol, str)
+                or not protocol.strip()
+                or not isinstance(vrf, str)
+                or not vrf.strip()
+            ):
+                raise RouteValidationError(
+                    f'Logical router "{logical_router}" returned '
+                    "a route without protocol or VRF."
+                )
+            next_hops = candidate.get("nexthops")
+            if not isinstance(next_hops, list):
+                raise RouteValidationError(
+                    f'Logical router "{logical_router}" returned invalid next hops.'
+                )
+            paths: list[RoutePath] = []
+            for path in next_hops:
+                if not isinstance(path, dict):
+                    raise RouteValidationError(
+                        f'Logical router "{logical_router}" returned '
+                        "an invalid next hop."
+                    )
+                address, interface = path.get("ip"), path.get("interfaceName")
+                if (
+                    (address is not None and not isinstance(address, str))
+                    or (interface is not None and not isinstance(interface, str))
+                    or not (_optional_string(address) or _optional_string(interface))
+                ):
+                    raise RouteValidationError(
+                        f'Logical router "{logical_router}" returned '
+                        "an incomplete next hop."
+                    )
+                paths.append(
+                    RoutePath(
+                        next_hop=_normalize_address(_optional_string(address)),
+                        interface=_optional_string(interface),
+                        weight=_route_optional_int(
+                            path.get("weight"), logical_router, "next-hop weight"
+                        ),
+                        active=_route_optional_bool(
+                            path.get("active"), logical_router, "next-hop active state"
+                        ),
+                    )
+                )
             routes.append(
                 RouteEntry(
                     routing_kind="logical-router",
                     routing_instance=logical_router,
-                    vrf=_optional_string(candidate.get("vrfName")),
+                    vrf=vrf.strip(),
                     prefix=prefix,
-                    protocol=str(candidate.get("protocol") or "unknown").casefold(),
-                    distance=_optional_int(candidate.get("distance")),
-                    metric=_optional_int(candidate.get("metric")),
-                    selected=_optional_bool(candidate.get("selected")),
-                    installed=_optional_bool(candidate.get("installed")),
+                    protocol=protocol.strip().casefold(),
+                    distance=_route_optional_int(
+                        candidate.get("distance"), logical_router, "distance"
+                    ),
+                    metric=_route_optional_int(
+                        candidate.get("metric"), logical_router, "metric"
+                    ),
+                    selected=_route_optional_bool(
+                        candidate.get("selected"), logical_router, "selected state"
+                    ),
+                    installed=_route_optional_bool(
+                        candidate.get("installed"), logical_router, "installed state"
+                    ),
                     paths=tuple(sorted(paths, key=_path_sort_key)),
                 )
             )
@@ -548,11 +732,78 @@ def _parse_legacy_routes(
     response: ET.Element,
     virtual_router: str,
 ) -> tuple[RouteEntry, ...]:
+    result = _route_result(response, virtual_router)
+    allowed = {"entry", "flags", "total-count", "count"}
+    if any(child.tag not in allowed for child in result):
+        raise RouteValidationError(
+            f'Virtual router "{virtual_router}" returned an unrecognized route table.'
+        )
+    if any(len(child) for child in result if child.tag != "entry"):
+        raise RouteValidationError(
+            f'Virtual router "{virtual_router}" returned invalid route metadata.'
+        )
+    entries = result.findall("./entry")
+    counts = [
+        result.get(key)
+        for key in ("count", "total-count")
+        if result.get(key) is not None
+    ]
+    counts.extend(
+        child.text for child in result if child.tag in {"count", "total-count"}
+    )
+    if any(
+        count is None or not count.isdecimal() or int(count) != len(entries)
+        for count in counts
+    ):
+        raise RouteValidationError(
+            f'Virtual router "{virtual_router}" returned an incomplete route table.'
+        )
+    if not entries and not counts:
+        legend = result.findtext("./flags") or ""
+        if not legend.strip().casefold().startswith("flags:"):
+            raise RouteValidationError(
+                f'Virtual router "{virtual_router}" returned an ambiguous '
+                "empty route table."
+            )
     routes: list[RouteEntry] = []
-    for entry in response.findall("./result/entry"):
+    for entry in entries:
+        for field in (
+            "virtual-router",
+            "destination",
+            "prefix",
+            "nexthop",
+            "next-hop",
+            "interface",
+            "flags",
+            "protocol",
+            "type",
+            "distance",
+            "admin-distance",
+            "metric",
+        ):
+            fields = entry.findall(field)
+            if len(fields) > 1 or any(len(node) for node in fields):
+                raise RouteValidationError(
+                    f'Virtual router "{virtual_router}" returned a route with '
+                    f'invalid or duplicate "{field}" fields.'
+                )
         prefix = entry.findtext("destination") or entry.findtext("prefix")
         if not prefix:
-            continue
+            raise RouteValidationError(
+                f'Virtual router "{virtual_router}" returned a route without a prefix.'
+            )
+        router_name = _optional_string(entry.findtext("virtual-router"))
+        if router_name and router_name.casefold() != virtual_router.casefold():
+            raise RouteValidationError(
+                f'Virtual router "{virtual_router}" returned a route '
+                "for another router."
+            )
+        protocol = _legacy_protocol(entry)
+        if protocol == "unknown":
+            raise RouteValidationError(
+                f'Virtual router "{virtual_router}" returned a route without '
+                "recognized protocol evidence."
+            )
         flags = "".join((entry.findtext("flags") or "").split()).replace("*", "")
         next_hop = _normalize_address(
             _optional_string(entry.findtext("nexthop") or entry.findtext("next-hop"))
@@ -566,16 +817,18 @@ def _parse_legacy_routes(
         routes.append(
             RouteEntry(
                 routing_kind="virtual-router",
-                routing_instance=(
-                    _optional_string(entry.findtext("virtual-router")) or virtual_router
-                ),
+                routing_instance=(router_name or virtual_router),
                 vrf=None,
-                prefix=_normalize_prefix(prefix),
-                protocol=_legacy_protocol(entry),
-                distance=_optional_int(
-                    entry.findtext("distance") or entry.findtext("admin-distance")
+                prefix=_route_prefix(prefix, virtual_router),
+                protocol=protocol,
+                distance=_route_optional_int(
+                    entry.findtext("distance") or entry.findtext("admin-distance"),
+                    virtual_router,
+                    "distance",
                 ),
-                metric=_optional_int(entry.findtext("metric")),
+                metric=_route_optional_int(
+                    entry.findtext("metric"), virtual_router, "metric"
+                ),
                 selected=True if "A" in flags else None,
                 installed=True if "A" in flags else None,
                 paths=paths,
@@ -844,6 +1097,12 @@ def compare_route_snapshots(
     if before.serial != after.serial or before.vsys != after.vsys:
         raise RouteValidationError(
             "Route snapshots must be from the same firewall serial and virtual system."
+        )
+    _assert_snapshot_coverage(before)
+    _assert_snapshot_coverage(after)
+    if set(before.captured_routing_instances) != set(after.captured_routing_instances):
+        raise RouteValidationError(
+            "The captured routing instances differ between route snapshots."
         )
     normalized_prefix_map = {
         _normalize_prefix(source): _normalize_prefix(destination)

@@ -1,24 +1,31 @@
 import hashlib
 import ipaddress
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Literal, cast
+from typing import Annotated, Literal, NoReturn, cast
 
 import typer
 from panos.errors import PanDeviceError
 from panos.panorama import Panorama
 
+from .artifacts import create_artifact_directory, write_private_artifact
 from .candidate import (
     CandidateLoadError,
+    CandidateLoadInterrupted,
+    CandidateLoadResult,
+    CandidateRestoreError,
     CandidateVariableSet,
     ReplacementTemplatePlacement,
+    capture_source_configuration,
     discover_lsvpn_satellite_template_owner,
     discover_replacement_template_placements,
     load_candidate_configuration,
-    load_panorama_snapshot,
     resolve_template_interface_address_reference,
+    restore_candidate_configuration,
 )
 from .config import ConfigurationFileError, configure_from_file, load_settings
 from .inventory import (
@@ -197,12 +204,14 @@ def routes_snapshot(
             managed.serial,
             vsys,
         )
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(snapshot.to_json(), encoding="utf-8")
+        write_private_artifact(output, snapshot.to_json(), overwrite=force)
         typer.echo(
             f'Captured {len(snapshot.routes)} routes from "{managed.name}" '
             f'({managed.serial}) to "{output}".'
         )
+    except OSError as exc:
+        typer.echo(f"Route snapshot file error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
     except (DiscoveryError, RouteValidationError) as exc:
         typer.echo(f"Route snapshot error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -610,7 +619,7 @@ def routes_verify_migration(
         )
         panorama = create_panorama(load_settings())
         destination = output_directory or manifest.parent
-        destination.mkdir(parents=True, exist_ok=True)
+        create_artifact_directory(destination)
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
         failed = False
         for endpoint in migration.endpoints:
@@ -626,11 +635,12 @@ def routes_verify_migration(
                 endpoint.serial,
                 endpoint.vsys,
             )
+            safe_name = re.sub(r"[^A-Za-z0-9_.-]", "-", endpoint.firewall_name)
             after_path = destination / (
                 f"LSVPN_POST_MIGRATION_{endpoint.role}_"
-                f"{endpoint.firewall_name}_{timestamp}_routes.json"
+                f"{safe_name}_{timestamp}_routes.json"
             )
-            after_path.write_text(after.to_json(), encoding="utf-8")
+            write_private_artifact(after_path, after.to_json())
             comparison = compare_route_snapshots(
                 baseline,
                 after,
@@ -714,18 +724,43 @@ def candidate_restore(
     try:
         if not yes:
             typer.confirm(
-                f'Load "{snapshot}" and replace the Panorama candidate '
-                "configuration? No commit or push will be issued.",
+                f'Load "{snapshot}" and replace the entire Panorama candidate, '
+                "including all pending changes? A pre-restore checkpoint will "
+                "be saved under configuration and commit locks. "
+                "No commit or push will be issued.",
                 abort=True,
             )
         panorama = create_panorama(load_settings())
-        load_panorama_snapshot(panorama, snapshot)
+        result = restore_candidate_configuration(
+            panorama,
+            snapshot,
+            on_checkpoint_saved=lambda name: typer.echo(
+                f'Pre-restore checkpoint saved on Panorama: "{name}"'
+            ),
+        )
         typer.echo(
-            f'Loaded Panorama snapshot "{snapshot}" into candidate configuration. '
+            f'Loaded Panorama snapshot "{result.snapshot_name}" '
+            "into candidate configuration. "
             "No commit or push was issued."
         )
+        typer.echo(f'Pre-restore checkpoint: "{result.checkpoint_name}"')
+        if result.lock_cleanup_error:
+            error = CandidateRestoreError(
+                "The requested snapshot was loaded, but lock cleanup failed."
+            )
+            error.lock_cleanup_error = result.lock_cleanup_error
+            raise error
     except typer.Abort:
         raise
+    except CandidateRestoreError as exc:
+        typer.echo(f"Candidate restore error: {exc}", err=True)
+        if exc.lock_cleanup_error:
+            typer.echo(
+                f"Lock cleanup failed: {exc.lock_cleanup_error}. "
+                "Inspect the reported Panorama locks before retrying.",
+                err=True,
+            )
+        raise typer.Exit(code=130 if exc.interrupted else 1) from exc
     except LsvpnConfigurationError as exc:
         typer.echo(f"Candidate restore error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -1326,6 +1361,104 @@ def _template_selection(
     return name, number
 
 
+@contextmanager
+def _migration_route_artifacts() -> Iterator[list[Path]]:
+    """Retain captured evidence when loading or capture is interrupted."""
+    paths: list[Path] = []
+    try:
+        yield paths
+    except (CandidateLoadInterrupted, KeyboardInterrupt, SystemExit):
+        if paths:
+            typer.echo("Route baselines retained after interruption:", err=True)
+            for path in paths:
+                typer.echo(f'  "{path}"', err=True)
+        raise
+    except CandidateLoadError:
+        typer.echo("Route baselines retained for recovery:", err=True)
+        for path in paths:
+            typer.echo(f'  "{path}"', err=True)
+        raise
+    except Exception:
+        for path in paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                typer.echo(f'Unable to remove artifact "{path}": {exc}', err=True)
+        raise
+
+
+def _report_candidate_error(
+    exc: CandidateLoadError, *, interrupted: bool = False
+) -> NoReturn:
+    label = "Candidate load interrupted" if interrupted else "Candidate load error"
+    typer.echo(f"{label}: {exc}", err=True)
+    if exc.lock_cleanup_error:
+        typer.echo(
+            f"Lock cleanup failed: {exc.lock_cleanup_error}. "
+            "Inspect the reported Panorama locks before retrying.",
+            err=True,
+        )
+    raise typer.Exit(code=130 if interrupted else 1) from exc
+
+
+def _finish_candidate_load(
+    result: CandidateLoadResult,
+    manifest: MigrationValidationManifest,
+    manifest_path: Path,
+    route_paths: list[Path],
+) -> None:
+    """Report the remote outcome before attempting local artifact publication."""
+    _heading("Candidate load result")
+    typer.echo("  Status: verified in Panorama candidate configuration")
+    typer.echo(
+        f"  Changes: {result.created_or_updated_objects} objects written, "
+        f"{result.removed_satellite_objects} legacy LSVPN objects, routes, "
+        "or bindings removed"
+    )
+    typer.echo(f'  Rollback snapshot: "{result.panorama_snapshot_name}"')
+    typer.echo("  Route baselines:")
+    for path in route_paths:
+        typer.echo(f'    "{path}"')
+    typer.echo("  Commit/push: not issued")
+    if result.lock_cleanup_error:
+        typer.echo(
+            f"  Lock cleanup failed: {result.lock_cleanup_error}. "
+            "Inspect the reported Panorama locks before retrying.",
+            err=True,
+        )
+
+    staging_path = manifest_path.with_suffix(".json.tmp")
+    try:
+        content = replace(
+            manifest, panorama_snapshot_name=result.panorama_snapshot_name
+        ).to_json()
+        write_private_artifact(
+            manifest_path, content, overwrite=True, retain_staging_on_error=True
+        )
+    except (Exception, KeyboardInterrupt, SystemExit) as exc:
+        error_type = (
+            CandidateLoadInterrupted
+            if isinstance(exc, (KeyboardInterrupt, SystemExit))
+            else CandidateLoadError
+        )
+        raise error_type(
+            "Candidate configuration is verified and remains staged; "
+            "no rollback was attempted. Validation manifest was not published "
+            f'to "{manifest_path}": {type(exc).__name__}: {exc}. '
+            "Route baselines are retained. Any manifest staging file at "
+            f'"{staging_path}" is retained and may be incomplete. '
+            "Resolve artifact errors before committing or pushing; do not rerun "
+            "the migration solely to recreate the manifest."
+        ) from exc
+    typer.echo(f'  Post-check manifest: "{manifest_path}"')
+    if result.lock_cleanup_error:
+        raise CandidateLoadError(
+            "Candidate configuration is verified and remains staged; recovery "
+            "artifacts were saved, but lock cleanup failed. "
+            "Inspect the reported Panorama locks before retrying."
+        )
+
+
 @app.command()
 def build(
     ctx: typer.Context,
@@ -1472,6 +1605,9 @@ def build(
         )
         settings = load_settings()
         panorama = create_panorama(settings)
+        source_configuration = (
+            [capture_source_configuration(panorama)] if load_candidate else []
+        )
         inventory = discover_firewall_templates(panorama, firewall_name)
 
         if template_number is None and spoke_template_name is None:
@@ -1502,6 +1638,11 @@ def build(
         typer.echo(f'  Spoke template: "{selected.name}"')
         typer.echo(f"  Hub firewall: {hub_inventory.firewall_name}")
         typer.echo(f'  Hub template: "{hub_selected.name}"')
+        if load_candidate:
+            source_configuration.extend(
+                capture_source_configuration(panorama, item.serial)
+                for item in (inventory, hub_inventory)
+            )
         selected_satellites = discover_lsvpn_satellites(
             panorama, inventory.serial, vsys
         )
@@ -1522,6 +1663,13 @@ def build(
         spoke_inventories = (
             shared_scope.firewalls if shared_scope is not None else (inventory,)
         )
+        if load_candidate:
+            captured_serials = {item.serial for item in source_configuration}
+            source_configuration.extend(
+                capture_source_configuration(panorama, item.serial)
+                for item in spoke_inventories
+                if item.serial not in captured_serials
+            )
         if not any(item.serial == inventory.serial for item in spoke_inventories):
             raise DiscoveryError(
                 f'Selected firewall "{inventory.firewall_name}" does not inherit '
@@ -1610,10 +1758,9 @@ def build(
                     abort=True,
                 )
             timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-            snapshot_directory.mkdir(parents=True, exist_ok=True)
-            route_snapshot_paths: list[Path] = []
+            create_artifact_directory(snapshot_directory)
             baselines: dict[tuple[str, str], tuple[Path, RouteSnapshot]] = {}
-            try:
+            with _migration_route_artifacts() as route_snapshot_paths:
                 endpoints = (
                     *(("spoke", item, vsys) for item in spoke_inventories),
                     ("hub", hub_inventory, hub_vsys),
@@ -1631,7 +1778,7 @@ def build(
                         endpoint_inventory.serial,
                         endpoint_vsys,
                     )
-                    route_path.write_text(route_snapshot.to_json(), encoding="utf-8")
+                    write_private_artifact(route_path, route_snapshot.to_json())
                     route_snapshot_paths.append(route_path)
                     baselines[(role, endpoint_inventory.serial)] = (
                         route_path,
@@ -1655,6 +1802,23 @@ def build(
                         )
                     )
                 placements = tuple(placement_list)
+                try:
+                    manifest = _build_group_migration_manifest(
+                        "",
+                        spoke_inventories,
+                        hub_inventory,
+                        vsys,
+                        hub_vsys,
+                        baselines,
+                        tuple(clone_plans),
+                    )
+                    # Catch construction/serialization errors before any remote writes.
+                    manifest.to_json()
+                except Exception as exc:
+                    raise LsvpnConfigurationError(
+                        f"Cannot prepare validation manifest: {exc}. "
+                        "Candidate loading was not attempted."
+                    ) from exc
                 candidate_result = load_candidate_configuration(
                     panorama,
                     selected.name,
@@ -1665,47 +1829,33 @@ def build(
                     hub_vsys,
                     shared_build.variables,
                     allow_dirty_candidate,
+                    on_snapshot_saved=lambda name: typer.echo(
+                        f'  Recovery snapshot saved on Panorama: "{name}"'
+                    ),
+                    source_configuration=tuple(source_configuration),
                 )
-            except Exception:
-                for route_path in route_snapshot_paths:
-                    route_path.unlink(missing_ok=True)
-                raise
-            manifest = _build_group_migration_manifest(
-                candidate_result.panorama_snapshot_name,
-                spoke_inventories,
-                hub_inventory,
-                vsys,
-                hub_vsys,
-                baselines,
-                tuple(clone_plans),
-            )
             spoke_safe_name = re.sub(r"[^A-Za-z0-9_.-]", "-", inventory.firewall_name)
             manifest_path = snapshot_directory / (
                 f"LSVPN_MIGRATION_{spoke_safe_name}_{timestamp}_validation.json"
             )
-            manifest_path.write_text(manifest.to_json(), encoding="utf-8")
-            _heading("Candidate load result")
-            typer.echo("  Status: verified in Panorama candidate configuration")
-            typer.echo(
-                "  Changes: "
-                f"{candidate_result.created_or_updated_objects} objects written, "
-                f"{candidate_result.removed_satellite_objects} legacy LSVPN "
-                "objects, routes, or bindings removed"
+            _finish_candidate_load(
+                candidate_result, manifest, manifest_path, route_snapshot_paths
             )
-            typer.echo(
-                f'  Rollback snapshot: "{candidate_result.panorama_snapshot_name}"'
-            )
-            typer.echo("  Route baselines:")
-            for route_path in route_snapshot_paths:
-                typer.echo(f'    "{route_path}"')
-            typer.echo(f'  Post-check manifest: "{manifest_path}"')
-            typer.echo("  Commit/push: not issued")
 
     except typer.Abort:
         raise
+    except CandidateLoadInterrupted as exc:
+        _report_candidate_error(exc, interrupted=True)
+    except (KeyboardInterrupt, SystemExit) as exc:
+        typer.echo(
+            "Migration interrupted. Inspect Panorama candidate configuration and "
+            "any reported recovery snapshot before retrying; no commit or push "
+            "was issued.",
+            err=True,
+        )
+        raise typer.Exit(code=130) from exc
     except CandidateLoadError as exc:
-        typer.echo(f"Candidate load error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
+        _report_candidate_error(exc)
     except (DiscoveryError, LsvpnConfigurationError) as exc:
         typer.echo(f"Discovery error: {exc}", err=True)
         raise typer.Exit(code=1) from exc

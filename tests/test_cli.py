@@ -1,11 +1,16 @@
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 from typer.testing import CliRunner
 
-from panos_tunnel_builder import cli
-from panos_tunnel_builder.candidate import CandidateLoadResult
+from panos_tunnel_builder import artifacts, cli
+from panos_tunnel_builder.candidate import (
+    CandidateLoadResult,
+    CandidateRestoreResult,
+    SourceConfigurationFingerprint,
+)
 from panos_tunnel_builder.inventory import (
     FirewallTemplateInventory,
     SharedTemplateScope,
@@ -118,11 +123,11 @@ def test_candidate_restore_loads_snapshot_without_commit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     panorama = Mock()
-    load_snapshot = Mock()
+    name = "LSVPN_PRE_a1b2c_260819120000.xml"
+    load_snapshot = Mock(return_value=CandidateRestoreResult(name, "checkpoint.xml"))
     monkeypatch.setattr(cli, "load_settings", Mock(return_value=Mock()))
     monkeypatch.setattr(cli, "create_panorama", Mock(return_value=panorama))
-    monkeypatch.setattr(cli, "load_panorama_snapshot", load_snapshot)
-    name = "LSVPN_PRE_a1b2c_260819120000.xml"
+    monkeypatch.setattr(cli, "restore_candidate_configuration", load_snapshot)
 
     result = runner.invoke(
         cli.app,
@@ -130,9 +135,67 @@ def test_candidate_restore_loads_snapshot_without_commit(
     )
 
     assert result.exit_code == 0
-    load_snapshot.assert_called_once_with(panorama, name)
+    assert load_snapshot.call_args.args == (panorama, name)
+    assert callable(load_snapshot.call_args.kwargs["on_checkpoint_saved"])
     assert "No commit or push was issued" in result.output
+    assert name in result.output
     assert not panorama.commit.called
+
+
+@pytest.mark.parametrize(
+    "scenario", ["success", "load-failed", "recovery-failed", "interrupted", "unlock"]
+)
+def test_restore_reports_checkpoint_recovery_and_cleanup_status(
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+) -> None:
+    checkpoint = "LSVPN_CHK_a1b2c_260819120000.xml"
+    monkeypatch.setattr(cli, "load_settings", Mock())
+    monkeypatch.setattr(cli, "create_panorama", Mock())
+
+    def restore(
+        panorama: object,
+        snapshot: str,
+        *,
+        on_checkpoint_saved: Callable[[str], None] | None = None,
+    ) -> CandidateRestoreResult:
+        assert on_checkpoint_saved is not None
+        on_checkpoint_saved(checkpoint)
+        if scenario in {"load-failed", "recovery-failed", "interrupted"}:
+            recovery = (
+                "Checkpoint recovery also failed; candidate may contain partial changes"
+                if scenario == "recovery-failed"
+                else "Pre-restore checkpoint was reloaded"
+            )
+            error = cli.CandidateRestoreError(
+                f'Restore failed. {recovery}. Checkpoint "{checkpoint}".',
+                interrupted=scenario == "interrupted",
+            )
+            if scenario == "recovery-failed":
+                error.lock_cleanup_error = "unlock failed"
+            raise error
+        return CandidateRestoreResult(
+            snapshot,
+            checkpoint,
+            lock_cleanup_error="unlock failed" if scenario == "unlock" else None,
+        )
+
+    monkeypatch.setattr(cli, "restore_candidate_configuration", restore)
+    result = runner.invoke(cli.app, ["candidate", "restore", "saved.xml", "--yes"])
+
+    assert result.exit_code == (
+        0 if scenario == "success" else 130 if scenario == "interrupted" else 1
+    )
+    assert "Pre-restore checkpoint saved on Panorama" in result.output
+    assert checkpoint in result.output
+    if scenario in {"success", "unlock"}:
+        assert 'Loaded Panorama snapshot "saved.xml"' in result.output
+        assert "No commit or push was issued" in result.output
+    else:
+        assert "Loaded Panorama snapshot" not in result.output
+        assert "Restore failed" in result.output
+    if scenario in {"unlock", "recovery-failed"}:
+        assert "Lock cleanup failed: unlock failed" in result.output
 
 
 def _template_inventory() -> FirewallTemplateInventory:
@@ -303,6 +366,15 @@ after = "missing-after.json"
 def test_load_candidate_is_successful_noop_when_satellite_is_already_absent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        cli,
+        "capture_source_configuration",
+        Mock(
+            side_effect=lambda _p, serial=None: SourceConfigurationFingerprint(
+                serial, "candidate", "running"
+            )
+        ),
+    )
     monkeypatch.setattr(cli, "load_settings", Mock(return_value=Mock()))
     monkeypatch.setattr(cli, "create_panorama", Mock(return_value=Mock()))
     monkeypatch.setattr(
@@ -495,11 +567,32 @@ def test_build_rejects_hub_stack_without_interface_template(
 
 
 @pytest.mark.parametrize("from_file", [False, True])
+@pytest.mark.parametrize(
+    "interrupted",
+    [
+        None,
+        "load",
+        "rollback",
+        "capture",
+        "system-exit",
+        "unlock",
+        "manifest-write",
+        "manifest-build",
+        "source-drift",
+    ],
+)
 def test_build_reports_lsvpn_clone_plan(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     from_file: bool,
+    interrupted: str | None,
 ) -> None:
+    source_capture = Mock(
+        side_effect=lambda _p, serial=None: SourceConfigurationFingerprint(
+            serial, "candidate", "running"
+        )
+    )
+    monkeypatch.setattr(cli, "capture_source_configuration", source_capture)
     satellite = SatelliteConfig(
         name="legacy-satellite",
         tunnel_interface="tunnel.2",
@@ -641,6 +734,62 @@ def test_build_reports_lsvpn_clone_plan(
     )
     monkeypatch.setattr(cli, "load_candidate_configuration", load_candidate)
 
+    if interrupted == "capture":
+        capture_routes.side_effect = [
+            capture_routes.side_effect.__next__(),
+            KeyboardInterrupt(),
+        ]
+    elif interrupted in {"load", "rollback", "system-exit"}:
+
+        def interrupt_load(*args: object, **kwargs: object) -> None:
+            callback = kwargs["on_snapshot_saved"]
+            assert callable(callback)
+            callback("LSVPN_PRE_a1b2c_260819120000.xml")
+            if interrupted == "system-exit":
+                raise SystemExit(2)
+            status = (
+                "rollback also failed; may contain partial migration changes"
+                if interrupted == "rollback"
+                else "rolled back to running configuration"
+            )
+            raise cli.CandidateLoadInterrupted(status)
+
+        load_candidate.side_effect = interrupt_load
+
+    if interrupted == "source-drift":
+        load_candidate.side_effect = cli.LsvpnConfigurationError(
+            "Source configuration changed since discovery. Candidate loading was "
+            "not attempted; rebuild and review a fresh plan and route baselines."
+        )
+    elif interrupted == "unlock":
+        load_candidate.return_value = CandidateLoadResult(
+            "LSVPN_PRE_a1b2c_260819120000.xml",
+            14,
+            5,
+            lock_cleanup_error="RuntimeError: simulated unlock failure",
+        )
+    elif interrupted == "manifest-build":
+        monkeypatch.setattr(
+            cli,
+            "_build_group_migration_manifest",
+            Mock(side_effect=ValueError("invalid manifest")),
+        )
+    elif interrupted == "manifest-write":
+        original_write = cli.write_private_artifact
+
+        def fail_manifest_write(
+            path: Path,
+            content: str,
+            *,
+            overwrite: bool = False,
+            retain_staging_on_error: bool = False,
+        ) -> None:
+            if retain_staging_on_error:
+                raise OSError("simulated disk full")
+            original_write(path, content, overwrite=overwrite)
+
+        monkeypatch.setattr(cli, "write_private_artifact", fail_manifest_write)
+
     if from_file:
         config = tmp_path / "tunnels.toml"
         config.write_text(
@@ -677,6 +826,50 @@ def test_build_reports_lsvpn_clone_plan(
         input="10.254.0.0/24\n",
     )
 
+    if interrupted == "source-drift":
+        assert result.exit_code == 1
+        assert "Source configuration changed" in result.output
+        assert "rebuild and review a fresh plan" in result.output
+        assert not tuple(tmp_path.glob("*_routes.json"))
+        assert not tuple(tmp_path.glob("*_validation.json"))
+        assert "Recovery snapshot saved" not in result.output
+        return
+    if interrupted == "manifest-build":
+        assert result.exit_code == 1
+        assert "Candidate loading was not attempted" in result.output
+        load_candidate.assert_not_called()
+        assert not tuple(tmp_path.glob("*_routes.json"))
+        return
+    if interrupted in {"unlock", "manifest-write"}:
+        assert result.exit_code == 1
+        assert "verified in Panorama candidate configuration" in result.output
+        assert "LSVPN_PRE_a1b2c_260819120000.xml" in result.output
+        assert "Commit/push: not issued" in result.output
+        assert len(tuple(tmp_path.glob("*_routes.json"))) == 2
+        if interrupted == "unlock":
+            assert "simulated unlock failure" in result.output
+            assert len(tuple(tmp_path.glob("*_validation.json"))) == 1
+        else:
+            assert "simulated disk full" in result.output
+            assert "remains staged" in result.output
+            assert not tuple(tmp_path.glob("*_validation.json"))
+        return
+    if interrupted:
+        assert result.exit_code == 130
+        assert "retained after interruption" in result.output
+        baselines = tuple(tmp_path.glob("*_routes.json"))
+        assert len(baselines) == (1 if interrupted == "capture" else 2)
+        assert all(str(path) in result.output for path in baselines)
+        assert not tuple(tmp_path.glob("*_validation.json"))
+        if interrupted == "capture":
+            load_candidate.assert_not_called()
+        else:
+            assert "Recovery snapshot saved on Panorama" in result.output
+            assert "LSVPN_PRE_a1b2c_260819120000.xml" in result.output
+        if interrupted == "rollback":
+            assert "may contain partial migration changes" in result.output
+        return
+
     assert result.exit_code == 0
     assert "Tunnel address pool (IPv4 /30s or IPv6 /127s)" in result.output
     assert "Shared spoke configuration" in result.output
@@ -697,11 +890,24 @@ def test_build_reports_lsvpn_clone_plan(
     assert len(tuple(tmp_path.glob("*_routes.json"))) == 2
     manifests = tuple(tmp_path.glob("*_validation.json"))
     assert len(manifests) == 1
+    if artifacts.os.name == "posix":
+        for path in (*tmp_path.glob("*_routes.json"), *manifests):
+            assert path.stat().st_mode & 0o777 == 0o600
     assert "LSVPN_PRE_a1b2c_260819120000.xml" in manifests[0].read_text()
     assert "Post-check manifest:" in result.output
     assert discover_placements.call_count == 1
     assert load_candidate.call_args.args[8] is True
     assert load_candidate.call_count == 1
+    assert [call.args[1:] for call in source_capture.call_args_list] == [
+        (),
+        ("001122",),
+        ("998877",),
+    ]
+    assert load_candidate.call_args.kwargs["source_configuration"] == (
+        SourceConfigurationFingerprint(None, "candidate", "running"),
+        SourceConfigurationFingerprint("001122", "candidate", "running"),
+        SourceConfigurationFingerprint("998877", "candidate", "running"),
+    )
     assert load_candidate.call_args.args[3][0].spoke.routing_object.name == "default"
     assert "SHA-256" in result.output
     assert "Crypto: IKEV2 aes-256-cbc/sha256" in result.output
@@ -973,8 +1179,10 @@ def test_restore_confirmation_defaults_and_cli_overrides(
     )
     monkeypatch.setattr(cli, "load_settings", Mock())
     monkeypatch.setattr(cli, "create_panorama", Mock())
-    load_snapshot = Mock()
-    monkeypatch.setattr(cli, "load_panorama_snapshot", load_snapshot)
+    load_snapshot = Mock(
+        return_value=CandidateRestoreResult("saved.xml", "checkpoint.xml")
+    )
+    monkeypatch.setattr(cli, "restore_candidate_configuration", load_snapshot)
 
     result = runner.invoke(
         cli.app,
@@ -1145,3 +1353,190 @@ def test_snapshot_explicit_overwrite_setting(
     assert result.exit_code == (0 if should_write else 1), result.output
     assert destination.read_text() == ("replacement" if should_write else "original")
     assert capture.call_count == int(should_write)
+    if should_write and artifacts.os.name == "posix":
+        assert destination.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("failure", ["fsync", "rename", "serialize"])
+@pytest.mark.parametrize("lock_failed", [False, True])
+def test_manifest_failure_preserves_candidate_and_recovery_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    failure: str,
+    lock_failed: bool,
+) -> None:
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text("baseline evidence")
+    destination = tmp_path / "validation.json"
+    destination.write_text("previous manifest")
+    result = CandidateLoadResult(
+        "LSVPN_PRE_a1b2c_260819120000.xml",
+        14,
+        5,
+        lock_cleanup_error="unlock failure" if lock_failed else None,
+    )
+    endpoint = cli.MigrationEndpointValidation(
+        role="spoke",
+        firewall_name="branch",
+        serial="001122",
+        vsys="vsys1",
+        baseline_snapshot=baseline.name,
+        prefix_map={},
+        path_mappings=(),
+        allowed_added_prefixes=(),
+    )
+    manifest = cli.MigrationValidationManifest(1, "test-time", "", (endpoint,))
+    if failure == "fsync":
+        monkeypatch.setattr(
+            artifacts.os, "fsync", Mock(side_effect=OSError("disk full"))
+        )
+    elif failure == "rename":
+        monkeypatch.setattr(Path, "replace", Mock(side_effect=OSError("rename denied")))
+    else:
+        monkeypatch.setattr(
+            cli.MigrationValidationManifest,
+            "to_json",
+            Mock(side_effect=ValueError("serialization failed")),
+        )
+
+    with pytest.raises(cli.CandidateLoadError) as raised:
+        cli._finish_candidate_load(result, manifest, destination, [baseline])
+
+    output = capsys.readouterr()
+    assert "verified in Panorama candidate configuration" in output.out
+    assert result.panorama_snapshot_name in output.out
+    assert str(baseline) in output.out
+    assert "Commit/push: not issued" in output.out
+    assert ("unlock failure" in output.err) is lock_failed
+    assert "remains staged" in str(raised.value)
+    assert "no rollback was attempted" in str(raised.value)
+    assert str(destination) in str(raised.value)
+    assert baseline.read_text() == "baseline evidence"
+    assert destination.read_text() == "previous manifest"
+    staging = destination.with_suffix(".json.tmp")
+    if failure != "serialize":
+        staged_manifest = cli.MigrationValidationManifest.from_json(staging.read_text())
+        assert staged_manifest.panorama_snapshot_name == result.panorama_snapshot_name
+    else:
+        assert not staging.exists()
+
+
+def test_transaction_and_lock_errors_retain_baselines_and_report_both(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text("recovery evidence")
+    original = cli.CandidateLoadError(
+        "write failure; rollback failed; saved snapshot example.xml"
+    )
+    original.lock_cleanup_error = "unlock failure"
+    with pytest.raises(cli.CandidateLoadError) as raised:
+        with cli._migration_route_artifacts() as paths:
+            paths.append(baseline)
+            raise original
+    assert raised.value is original
+    assert baseline.read_text() == "recovery evidence"
+    with pytest.raises(cli.typer.Exit) as exited:
+        cli._report_candidate_error(original)
+    assert exited.value.exit_code == 1
+    output = capsys.readouterr().err
+    assert str(baseline) in output
+    assert "rollback failed" in output
+    assert "example.xml" in output
+    assert "unlock failure" in output
+
+
+def test_artifact_cleanup_failure_does_not_mask_preflight_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    baseline = tmp_path / "baseline.json"
+    original = ValueError("preflight failed")
+    monkeypatch.setattr(Path, "unlink", Mock(side_effect=OSError("delete denied")))
+    with pytest.raises(ValueError) as raised:
+        with cli._migration_route_artifacts() as paths:
+            paths.append(baseline)
+            raise original
+    assert raised.value is original
+    assert "delete denied" in capsys.readouterr().err
+
+
+def test_build_captures_shared_sources_before_discovery_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    spoke = _template_inventory()
+    hub = _hub_template_inventory()
+    extra = replace(spoke, firewall_name="branch-02", serial="003344")
+    events: list[str] = []
+    panorama = Mock()
+    monkeypatch.setattr(cli, "load_settings", Mock(return_value=Mock()))
+    monkeypatch.setattr(cli, "create_panorama", Mock(return_value=panorama))
+
+    def capture(
+        _panorama: object, serial: str | None = None
+    ) -> SourceConfigurationFingerprint:
+        events.append(f"capture:{serial}")
+        return SourceConfigurationFingerprint(serial, "candidate", "running")
+
+    def inventory(_panorama: object, name: str) -> FirewallTemplateInventory:
+        events.append(f"inventory:{name}")
+        return spoke if name == "branch-01" else hub
+
+    def satellites(*args: object) -> tuple[Mock, ...]:
+        events.append("satellites")
+        satellite = Mock()
+        satellite.name = "legacy"
+        return (satellite,)
+
+    def scope(*args: object) -> SharedTemplateScope:
+        events.append("scope")
+        return SharedTemplateScope("branch-network", (spoke, extra))
+
+    def build(*args: object) -> cli.SharedBuildResult:
+        events.append("plan")
+        return cli.SharedBuildResult((), cli.CandidateVariableSet())
+
+    monkeypatch.setattr(cli, "capture_source_configuration", capture)
+    monkeypatch.setattr(cli, "discover_firewall_templates", inventory)
+    monkeypatch.setattr(cli, "discover_lsvpn_satellites", satellites)
+    monkeypatch.setattr(
+        cli,
+        "discover_lsvpn_satellite_template_owner",
+        Mock(return_value="branch-network"),
+    )
+    monkeypatch.setattr(cli, "discover_shared_template_scope", scope)
+    monkeypatch.setattr(cli, "_build_shared_migration", build)
+    result = runner.invoke(
+        cli.app,
+        [
+            "build",
+            "branch-01",
+            "--spoke-template-name",
+            "branch-network",
+            "--hub",
+            "hub-01",
+            "--hub-template-name",
+            "hub-network",
+            "--tunnel-address-pool",
+            "10.254.0.0/24",
+            "--load-candidate",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert events == [
+        "capture:None",
+        "inventory:branch-01",
+        "inventory:hub-01",
+        "capture:001122",
+        "capture:998877",
+        "satellites",
+        "scope",
+        "capture:003344",
+        "plan",
+    ]

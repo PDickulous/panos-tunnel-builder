@@ -13,13 +13,32 @@ Set Panorama connection values in the process environment, a `.env` file, or the
 | `PANORAMA_API_KEY` | `panorama.api_key` | None | Required API key. |
 | `PANORAMA_PORT` | `panorama.port` | `443` | Integer from 1 to 65535. |
 | `PANORAMA_VERIFY_SSL` | `panorama.verify_ssl` | `true` | Whether to verify TLS certificates. |
+| `PANORAMA_CA_BUNDLE` | `panorama.ca_bundle` | System trust store | Optional path to a PEM CA bundle for Panorama. |
 
 Environment TLS values accept `true`/`false`, `yes`/`no`, `on`/`off`, or `1`/`0`,
 ignoring case and surrounding whitespace. Other values fail validation. TOML
 requires a boolean for `verify_ssl` and an integer for `port`.
 
 Copy [`.env.example`](../.env.example) to `.env` and replace its placeholder API
-key and example host. TLS verification is enabled by default.
+key and example host. The CLI reads `.env` only from its current working
+directory, regardless of where it is installed. It does not search parent
+directories or the installation directory. When running from another directory,
+put the file there, export the values, or select a TOML file with `--config`.
+TLS verification is enabled by default.
+
+The HTTPS connection verifies both the certificate chain and the Panorama
+hostname, including requests redirected through Panorama to a managed firewall.
+For a private CA, set `PANORAMA_CA_BUNDLE=/path/to/ca-bundle.pem` or
+`ca_bundle = "/path/to/ca-bundle.pem"` in `[panorama]`. The bundle supplies the
+trusted CA certificates instead of the default system trust store. Relative
+paths resolve from the command's working directory. Missing or invalid bundles
+fail before an API request is sent.
+
+Use a Panorama hostname (or IP address) present in its certificate's subject
+alternative names. `PANORAMA_VERIFY_SSL=false` explicitly disables certificate
+and hostname verification and should be limited to controlled lab use. The TLS
+fix means self-signed/untrusted appliances that previously connected despite
+`verify_ssl=true` now require a trusted certificate or configured CA bundle.
 
 ## TOML command defaults
 
@@ -68,10 +87,17 @@ confirmation prompts (the default). Setting it to `true` is equivalent to
   confirmation, and use of the portal gateway when it differs from the active
   gateway. Gateway mismatch warnings are still displayed.
 - For `candidate restore`, it accepts replacing the Panorama candidate with the
-  named saved configuration.
+  named saved configuration, including replacement of all pending changes.
+  Configuration and commit locks, the unfinished-job check, and a fresh
+  pre-restore checkpoint remain mandatory.
 - It does not supply missing inputs. Firewall identities, template selections,
   and the tunnel address pool can still prompt. It does not bypass validation
   or enable candidate loading; `load_candidate` remains a separate setting.
+
+Candidate loading always rechecks the configuration fingerprints captured before
+discovery. Neither confirmation settings nor allowing pending candidate changes
+can bypass source-drift detection. Changed configuration requires a fresh build
+and review.
 
 Explicit `--no-yes` restores confirmations even if the file sets
 `skip_confirmation = true`. This setting is not an environment variable.
@@ -108,7 +134,7 @@ boolean forms). Positional argument order is unchanged.
 ## Precedence
 
 For connection settings, process environment values take precedence over `.env`
-values, and environment values take precedence over the TOML `[panorama]` table.
+values, and `.env` values take precedence over the TOML `[panorama]` table.
 The port and TLS defaults apply when no setting is provided.
 
 For command parameters, explicit command-line arguments and options override

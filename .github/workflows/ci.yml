@@ -38,3 +38,15 @@ jobs:
 
       - name: Run Pyright
         run: .venv/bin/pyright
+
+      - name: Build and inspect distributions
+        run: |
+          .venv/bin/python -m build --outdir "$RUNNER_TEMP/panos-distributions"
+          .venv/bin/python scripts/check_distributions.py "$RUNNER_TEMP/panos-distributions"
+
+      - name: Smoke test installed wheel
+        run: |
+          python -m venv "$RUNNER_TEMP/panos-wheel-venv"
+          "$RUNNER_TEMP/panos-wheel-venv/bin/python" -m pip install "$RUNNER_TEMP/panos-distributions/"*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/panos-wheel-venv/bin/panos-tunnel-builder" --help > /dev/null

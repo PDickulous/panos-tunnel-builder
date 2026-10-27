@@ -196,10 +196,10 @@ candidate transaction.
 
 Candidate loading is all-or-nothing. Variables and their overrides are written
 inside the same candidate transaction as the replacement objects. A write or
-post-write verification failure issues Panorama's candidate rollback and local
-pre-route artifacts from that failed attempt are removed. A successful rerun
-rotates paired PSK variables; a failed run leaves no variable or PSK state for
-the next attempt. If no LSVPN satellite configuration remains, a load request
+post-write verification failure issues Panorama's candidate rollback; local
+pre-route artifacts are retained for recovery. A successful rerun rotates paired
+PSK variables; a failed run whose rollback succeeds leaves no variable or PSK
+state for the next attempt. If no LSVPN satellite configuration remains, a load request
 is treated as a successful no-op.
 
 ## Panorama placement and safety
@@ -211,7 +211,8 @@ configuration, and allows the operator to override the recommended selection.
 
 The default workflow performs Panorama discovery and generates a local preview.
 With the explicit `--load-candidate` option, the tool acquires a temporary
-Panorama configuration lock and first verifies that candidate configuration
+Panorama configuration and commit locks, rejects unfinished or unverifiable
+jobs, and verifies that candidate configuration
 matches running configuration. A dirty candidate is rejected by default because
 the failure rollback is global. The explicit `--allow-pending-candidate-changes` option
 bypasses that protection with a warning. A clean-candidate run saves a
@@ -232,6 +233,19 @@ unchanged. Unrelated name and variable-type collisions are rejected. Reruns
 update objects and variables carrying the tool's ownership markers and rotate
 both ends of every PSK pair.
 
+Before inventory discovery, candidate-loading builds fingerprint Panorama's full
+candidate and running configurations. Before reading managed-firewall plan inputs,
+they fingerprint full candidate, running, and effective-running configuration on
+the hub and every spoke in the expanded scope. SHA-256 digests of canonical XML
+remain in memory. After lock acquisition and the job check, the transaction
+requires all source fingerprints to match, including when pending candidate
+changes are explicitly allowed. Drift or unreadable sources stop before snapshot,
+preflight writes, or rollback; the operator must build and review a fresh plan.
+This catches changes committed between discovery and loading even when candidate
+and running match. The comparison covers unrelated configuration conservatively;
+it ignores whitespace and the same administrative metadata as the clean-candidate
+comparison. It does not lock managed-firewall changes or operational state.
+
 PAN-OS interface imports under `vsys/import/network/interface` are migrated as
 part of that workflow. Each replacement tunnel interface is imported into the
 same endpoint vsys in the source-owning template, and the obsolete spoke tunnel
@@ -244,11 +258,31 @@ Panorama snapshot can be loaded back into candidate configuration with the
 separate restore command; committing and pushing that rollback remains an
 operator-controlled action.
 
+Snapshot restore acquires both locks, checks jobs, and saves a fresh checkpoint of
+the current candidate, including any pending changes, before loading the
+requested snapshot. The checkpoint name is reported before replacement. A load
+failure or interruption attempts to reload that checkpoint under the same locks;
+it does not use the migration workflow's global revert-to-running operation.
+Checkpoint recovery failures and lock-release failures are reported separately.
+A successful load followed by a failed lock release remains a loaded candidate
+and returns a nonzero CLI status. Restore never commits or pushes.
+
 Candidate loading is transactional after the rollback snapshot is saved. Any
 subsequent object write, spoke cleanup, or post-write verification error causes
 the tool to issue Panorama's candidate rollback command before releasing its
-configuration lock. This restores candidate configuration to running config
+configuration and commit locks. This restores candidate configuration to running config
 without a commit; it also discards other pending candidate changes. The named
 snapshot remains available for manual recovery but is not loaded automatically.
 If Panorama rejects the rollback, the command reports both failures and warns
 that partial candidate changes may remain.
+
+Only confirmed acquisitions authorize release. Configuration-lock cleanup is
+attempted first, then commit-lock cleanup, even if the first release fails.
+Both failures are tracked independently of the transaction result. A failed lock
+release preserves either the verified result or the original load/rollback
+error, and the CLI reports the cleanup error separately. Manifest construction
+and an initial serialization check occur before candidate loading. After a
+verified load, the CLI reports the remote state before atomically publishing the
+manifest. Artifact publication or lock-cleanup failures return nonzero while
+preserving the verified candidate and recovery baselines; they do not trigger a
+new rollback.

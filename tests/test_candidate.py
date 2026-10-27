@@ -9,6 +9,13 @@ from panos.panorama import Panorama
 from panos_tunnel_builder import candidate, lsvpn
 
 
+@pytest.fixture(autouse=True)
+def verified_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    # These transaction tests isolate source validation, exercised separately in
+    # test_source_configuration.py with real XML and lock sequencing.
+    monkeypatch.setattr(candidate, "assert_source_configuration_unchanged", Mock())
+
+
 def _plan(
     local_address: str = "203.0.113.13/24",
     dynamic: lsvpn.DynamicRoutingCloneSource | None = None,
@@ -159,6 +166,9 @@ def _panorama() -> tuple[Panorama, Mock]:
     panorama = Panorama("panorama.example.test", api_key="api-key")
     panorama._version_info = (11, 1, 0)
     xapi = Mock()
+    xapi.op.return_value = ET.fromstring(
+        '<response status="success"><result /></response>'
+    )
     panorama._xapi_private = xapi
     return panorama, xapi
 
@@ -297,6 +307,180 @@ def test_loads_saved_snapshot_without_commit() -> None:
     assert b"<load><config><from>" in command
     assert name.encode() in command
     assert not xapi.commit.called
+
+
+def test_restore_saves_checkpoint_before_replacing_pending_candidate() -> None:
+    panorama, xapi = _panorama()
+    target = "saved.xml"
+    reported: list[str] = []
+
+    def checkpoint_saved(name: str) -> None:
+        assert panorama.config_locked and panorama.commit_locked
+        commands = [ET.fromstring(call.args[0]) for call in xapi.op.call_args_list]
+        assert [command.tag for command in commands] == [
+            "request",
+            "request",
+            "show",
+            "save",
+        ]
+        assert commands[-1].findtext("config/to") == name
+        reported.append(name)
+
+    result = candidate.restore_candidate_configuration(
+        panorama,
+        target,
+        on_checkpoint_saved=checkpoint_saved,
+    )
+
+    commands = [ET.fromstring(call.args[0]) for call in xapi.op.call_args_list]
+    assert commands[0].find("config-lock/add") is not None
+    assert commands[1].find("commit-lock/add") is not None
+    assert commands[2].find("jobs/all") is not None
+    assert commands[3].findtext("config/to") == result.checkpoint_name
+    assert commands[4].findtext("config/from") == target
+    assert commands[5].find("config-lock/remove") is not None
+    assert commands[6].find("commit-lock/remove") is not None
+    assert reported == [result.checkpoint_name]
+    assert result.checkpoint_name.startswith("LSVPN_CHK_")
+    assert len(result.checkpoint_name) <= 32
+    assert result.snapshot_name == target
+    assert result.lock_cleanup_error is None
+    assert not panorama.config_locked
+    assert not xapi.commit.called
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("recovery_failure", [None, RuntimeError, KeyboardInterrupt])
+@pytest.mark.parametrize("unlock_failed", [False, True])
+def test_restore_failure_recovers_pending_candidate_before_unlock(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: type[BaseException],
+    recovery_failure: type[BaseException] | None,
+    unlock_failed: bool,
+) -> None:
+    panorama, xapi = _panorama()
+    state = {"candidate": "pending work before restore"}
+    checkpoint = "LSVPN_CHK_a1b2c_260819123456.xml"
+    events = Mock()
+    original = failure("restore request failed")
+    saved_state = state["candidate"]
+
+    def load_snapshot(_panorama: Panorama, name: str) -> None:
+        assert panorama.config_locked and panorama.commit_locked
+        events.load(name)
+        if name == "saved.xml":
+            state["candidate"] = "partially replaced"
+            raise original
+        assert name == checkpoint
+        if recovery_failure:
+            raise recovery_failure("checkpoint recovery failed")
+        state["candidate"] = saved_state
+
+    monkeypatch.setattr(
+        candidate, "save_pre_migration_snapshot", Mock(return_value=checkpoint)
+    )
+    monkeypatch.setattr(candidate, "load_panorama_snapshot", load_snapshot)
+    monkeypatch.setattr(panorama, "remove_config_lock", events.unlock)
+    if unlock_failed:
+        events.unlock.side_effect = RuntimeError("unlock failed")
+
+    with pytest.raises(candidate.CandidateRestoreError) as raised:
+        candidate.restore_candidate_configuration(panorama, "saved.xml")
+
+    assert [call[0] for call in events.mock_calls] == ["load", "load", "unlock"]
+    assert checkpoint in str(raised.value)
+    assert "restore request failed" in str(raised.value)
+    assert raised.value.__cause__ is original
+    assert raised.value.interrupted is (
+        failure is not RuntimeError or recovery_failure is KeyboardInterrupt
+    )
+    assert bool(raised.value.lock_cleanup_error) is unlock_failed
+    if recovery_failure:
+        assert state["candidate"] == "partially replaced"
+        assert "may contain partial changes" in str(raised.value)
+        assert "checkpoint recovery failed" in str(raised.value)
+    else:
+        assert state["candidate"] == saved_state
+        assert "was reloaded" in str(raised.value)
+    assert not any(b"<revert>" in call.args[0] for call in xapi.op.call_args_list)
+    assert not xapi.commit.called
+
+
+@pytest.mark.parametrize("stage", ["lock", "checkpoint", "notification"])
+def test_restore_preparation_failure_does_not_replace_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    panorama, _ = _panorama()
+    load = Mock()
+    release = Mock()
+    notify = Mock()
+    save = Mock(return_value="checkpoint.xml")
+    monkeypatch.setattr(candidate, "save_pre_migration_snapshot", save)
+    monkeypatch.setattr(candidate, "load_panorama_snapshot", load)
+    monkeypatch.setattr(panorama, "remove_config_lock", release)
+    if stage == "lock":
+        monkeypatch.setattr(
+            panorama, "add_config_lock", Mock(side_effect=RuntimeError("lock held"))
+        )
+    elif stage == "checkpoint":
+        save.side_effect = RuntimeError("cannot save")
+    else:
+        notify.side_effect = KeyboardInterrupt()
+    with pytest.raises(candidate.CandidateRestoreError, match="not attempted"):
+        candidate.restore_candidate_configuration(
+            panorama, "saved.xml", on_checkpoint_saved=notify
+        )
+    load.assert_not_called()
+    assert release.call_count == int(stage != "lock")
+    if stage == "lock":
+        save.assert_not_called()
+
+
+def test_restore_invalid_name_fails_before_locking() -> None:
+    panorama, xapi = _panorama()
+    with pytest.raises(lsvpn.LsvpnConfigurationError):
+        candidate.restore_candidate_configuration(panorama, "../../config.xml")
+    assert not xapi.op.called
+
+
+def test_restore_requires_successful_lock_acquisition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    panorama, _ = _panorama()
+    monkeypatch.setattr(panorama, "add_config_lock", Mock(return_value=False))
+    save = Mock()
+    release = Mock()
+    monkeypatch.setattr(candidate, "save_pre_migration_snapshot", save)
+    monkeypatch.setattr(panorama, "remove_config_lock", release)
+    with pytest.raises(candidate.CandidateRestoreError, match="lock was not acquired"):
+        candidate.restore_candidate_configuration(panorama, "saved.xml")
+    save.assert_not_called()
+    release.assert_not_called()
+
+
+def test_restore_lock_release_failure_preserves_loaded_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    panorama, xapi = _panorama()
+    monkeypatch.setattr(
+        panorama, "remove_config_lock", Mock(side_effect=RuntimeError("unlock failed"))
+    )
+    result = candidate.restore_candidate_configuration(panorama, "saved.xml")
+    assert result.snapshot_name == "saved.xml"
+    assert result.checkpoint_name.startswith("LSVPN_CHK_")
+    assert (
+        result.lock_cleanup_error == "configuration lock: RuntimeError: unlock failed"
+    )
+    commands = [ET.fromstring(call.args[0]) for call in xapi.op.call_args_list]
+    assert [command.tag for command in commands] == [
+        "request",
+        "request",
+        "show",
+        "save",
+        "load",
+        "request",
+    ]
 
 
 def test_clean_candidate_guard_accepts_matching_configuration() -> None:
@@ -471,11 +655,12 @@ def test_loads_candidate_without_commit_and_removes_only_spoke_lsvpn(
         (replacement,),
         (_placement(),),
         allow_dirty_candidate=True,
+        source_configuration=(),
     )
 
     assert result.created_or_updated_objects == 14
     assert result.removed_satellite_objects == 5
-    assert xapi.op.call_count == 3
+    assert xapi.op.call_count == 6
     mutation_order = [
         call[0] for call in xapi.method_calls if call[0] in {"delete", "set", "edit"}
     ]
@@ -537,9 +722,10 @@ def test_candidate_collision_fails_before_snapshot_or_write() -> None:
             (replacement,),
             (_placement(),),
             allow_dirty_candidate=True,
+            source_configuration=(),
         )
 
-    assert xapi.op.call_count == 2
+    assert xapi.op.call_count == 5
     assert not any(b"<save>" in call.args[0] for call in xapi.op.call_args_list)
     assert not xapi.set.called
     assert not xapi.edit.called
@@ -591,11 +777,12 @@ def test_candidate_reload_updates_owned_objects_with_a_fresh_plan(
         (replacement,),
         (_placement(),),
         allow_dirty_candidate=True,
+        source_configuration=(),
     )
 
     assert result.created_or_updated_objects == 14
     assert xapi.edit.call_count == 8
-    assert xapi.op.call_count == 3
+    assert xapi.op.call_count == 6
     assert not xapi.commit.called
     verify.assert_called_once()
 
@@ -668,6 +855,189 @@ def test_candidate_write_failure_automatically_rolls_back_candidate(
         )
 
     rollback.assert_called_once_with(panorama)
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize(
+    "phase", ["_write_variables", "_write_endpoint", "verify_candidate_configuration"]
+)
+@pytest.mark.parametrize("rollback_failure", [None, RuntimeError, KeyboardInterrupt])
+def test_interruption_rolls_back_before_unlocking(
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: type[BaseException],
+    phase: str,
+    rollback_failure: type[BaseException] | None,
+) -> None:
+    panorama, xapi = _panorama()
+    plan = _plan()
+    replacement = lsvpn.build_standard_ipsec_objects(plan)
+    snapshot = "LSVPN_PRE_a1b2c_260819120000.xml"
+    events = Mock()
+    xapi.get.return_value = ET.fromstring("<response><result /></response>")
+    for name, value in (
+        ("audit_spoke_interface_dependencies", None),
+        ("_preflight_endpoint", False),
+        ("_hub_lsvpn_fingerprint", ()),
+        ("_routing_scope_fingerprint", ()),
+        ("_routing_mutable_route_names", {}),
+        ("save_pre_migration_snapshot", snapshot),
+    ):
+        monkeypatch.setattr(candidate, name, Mock(return_value=value))
+    monkeypatch.setattr(candidate, phase, Mock(side_effect=interruption()))
+    events.rollback.side_effect = rollback_failure() if rollback_failure else None
+    monkeypatch.setattr(candidate, "rollback_candidate_configuration", events.rollback)
+    monkeypatch.setattr(panorama, "remove_config_lock", events.unlock)
+
+    with pytest.raises(candidate.CandidateLoadInterrupted) as raised:
+        candidate.load_candidate_configuration(
+            panorama,
+            "branch-01",
+            (plan,),
+            (replacement,),
+            (_placement(),),
+            allow_dirty_candidate=True,
+            on_snapshot_saved=events.snapshot,
+            source_configuration=(),
+        )
+
+    assert [call[0] for call in events.mock_calls] == ["snapshot", "rollback", "unlock"]
+    events.snapshot.assert_called_once_with(snapshot)
+    events.rollback.assert_called_once_with(panorama)
+    assert snapshot in str(raised.value)
+    assert interruption.__name__ in str(raised.value)
+    assert isinstance(raised.value.__cause__, interruption)
+    if rollback_failure:
+        assert "may contain partial migration changes" in str(raised.value)
+        assert rollback_failure.__name__ in str(raised.value)
+    else:
+        assert "rolled back to running configuration" in str(raised.value)
+    assert not xapi.commit.called
+
+
+def test_interruption_before_snapshot_does_not_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    panorama, xapi = _panorama()
+    plan = _plan()
+    rollback = Mock()
+    monkeypatch.setattr(
+        candidate, "_preflight_variables", Mock(side_effect=KeyboardInterrupt)
+    )
+    monkeypatch.setattr(candidate, "rollback_candidate_configuration", rollback)
+    with pytest.raises(KeyboardInterrupt):
+        candidate.load_candidate_configuration(
+            panorama,
+            "branch-01",
+            (plan,),
+            (lsvpn.build_standard_ipsec_objects(plan),),
+            (_placement(),),
+            allow_dirty_candidate=True,
+            source_configuration=(),
+        )
+    rollback.assert_not_called()
+    assert not xapi.set.called
+    assert not xapi.delete.called
+    assert any(b"<remove" in call.args[0] for call in xapi.op.call_args_list)
+
+
+@pytest.mark.parametrize("cleanup_failure", [RuntimeError, KeyboardInterrupt])
+def test_lock_release_failure_preserves_verified_result(
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_failure: type[BaseException],
+) -> None:
+    panorama, _ = _panorama()
+    result = candidate.CandidateLoadResult("LSVPN_PRE_a1b2c_260819120000.xml", 14, 5)
+    monkeypatch.setattr(
+        candidate, "_load_candidate_configuration_locked", Mock(return_value=result)
+    )
+    release = Mock(side_effect=cleanup_failure("unlock failed"))
+    monkeypatch.setattr(panorama, "remove_config_lock", release)
+    rollback = Mock()
+    monkeypatch.setattr(candidate, "rollback_candidate_configuration", rollback)
+
+    actual = candidate.load_candidate_configuration(
+        panorama,
+        "branch",
+        (),
+        (),
+        (),
+        source_configuration=(),
+    )
+
+    assert actual.panorama_snapshot_name == result.panorama_snapshot_name
+    assert actual.created_or_updated_objects == 14
+    assert (
+        actual.lock_cleanup_error
+        == f"configuration lock: {cleanup_failure.__name__}: unlock failed"
+    )
+    rollback.assert_not_called()
+    release.assert_called_once()
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_lock_release_failure_preserves_transaction_error(
+    monkeypatch: pytest.MonkeyPatch,
+    interrupted: bool,
+) -> None:
+    panorama, _ = _panorama()
+    error_type = (
+        candidate.CandidateLoadInterrupted
+        if interrupted
+        else candidate.CandidateLoadError
+    )
+    original = error_type("write failed and rollback failed; saved snapshot retained")
+    monkeypatch.setattr(
+        candidate, "_load_candidate_configuration_locked", Mock(side_effect=original)
+    )
+    monkeypatch.setattr(
+        panorama, "remove_config_lock", Mock(side_effect=RuntimeError("unlock failed"))
+    )
+
+    with pytest.raises(error_type) as raised:
+        candidate.load_candidate_configuration(
+            panorama,
+            "branch",
+            (),
+            (),
+            (),
+            source_configuration=(),
+        )
+
+    assert raised.value is original
+    assert "write failed and rollback failed" in str(raised.value)
+    assert (
+        raised.value.lock_cleanup_error
+        == "configuration lock: RuntimeError: unlock failed"
+    )
+
+
+def test_lock_release_failure_reports_original_preflight_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    panorama, _ = _panorama()
+    original = ValueError("preflight failed")
+    monkeypatch.setattr(
+        candidate, "_load_candidate_configuration_locked", Mock(side_effect=original)
+    )
+    monkeypatch.setattr(
+        panorama, "remove_config_lock", Mock(side_effect=RuntimeError("unlock failed"))
+    )
+    with pytest.raises(
+        candidate.CandidateLoadError, match="preflight failed"
+    ) as raised:
+        candidate.load_candidate_configuration(
+            panorama,
+            "branch",
+            (),
+            (),
+            (),
+            source_configuration=(),
+        )
+    assert raised.value.__cause__ is original
+    assert (
+        raised.value.lock_cleanup_error
+        == "configuration lock: RuntimeError: unlock failed"
+    )
 
 
 def test_candidate_write_reports_automatic_rollback_failure(

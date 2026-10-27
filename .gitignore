@@ -14,3 +14,9 @@ migration-snapshots/
 
 # Local connection settings may contain API keys.
 /panos-tunnel-builder.toml
+
+# Generated migration artifacts are sensitive even outside the default directory.
+LSVPN_*_routes.json
+LSVPN_*_routes.json.tmp
+LSVPN_MIGRATION_*_validation.json
+LSVPN_MIGRATION_*_validation.json.tmp

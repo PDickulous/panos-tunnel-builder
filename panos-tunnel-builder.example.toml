@@ -4,6 +4,8 @@ host = "panorama.example.com"
 api_key = "replace-with-api-key"
 port = 443
 verify_ssl = true
+# Optional PEM CA bundle for a private CA; relative paths use the working directory.
+# ca_bundle = "/path/to/ca-bundle.pem"
 
 [build]
 spoke_firewall = "branch-01"

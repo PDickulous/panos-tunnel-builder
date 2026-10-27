@@ -13,6 +13,7 @@ class Settings:
     panorama_api_key: str
     panorama_port: int = 443
     verify_ssl: bool = True
+    ca_bundle: str | None = None
 
 
 class ConfigurationFileError(RuntimeError):
@@ -41,7 +42,7 @@ _COMMAND_KEY_MAPS: dict[tuple[str, ...], dict[str, str]] = {
 }
 
 _CONFIGURATION_KEYS: dict[str, object] = {
-    "panorama": {"host", "api_key", "port", "verify_ssl"},
+    "panorama": {"host", "api_key", "port", "verify_ssl", "ca_bundle"},
     "status": set(),
     "build": {
         "spoke_firewall",
@@ -108,7 +109,7 @@ def configure_from_file(path: Path | None) -> dict[str, Any]:
     _validate_keys(values, _CONFIGURATION_KEYS, "configuration")
     panorama = values.pop("panorama", {})
     assert isinstance(panorama, dict)
-    for key in ("host", "api_key"):
+    for key in ("host", "api_key", "ca_bundle"):
         if key in panorama and not isinstance(panorama[key], str):
             raise ConfigurationFileError(
                 f'Configuration value "panorama.{key}" must be a string.'
@@ -157,7 +158,9 @@ def _parse_bool(value: str) -> bool:
 
 
 def load_settings() -> Settings:
-    load_dotenv()
+    # The installed package may live outside the operator's working directory.
+    # Do not search the installation tree or parents for connection credentials.
+    load_dotenv(dotenv_path=Path.cwd() / ".env", override=False)
 
     host = os.getenv("PANORAMA_HOST") or _panorama_file_settings.get("host")
     api_key = os.getenv("PANORAMA_API_KEY") or _panorama_file_settings.get("api_key")
@@ -178,6 +181,11 @@ def load_settings() -> Settings:
         panorama_host=str(host),
         panorama_api_key=str(api_key),
         panorama_port=port,
+        ca_bundle=(
+            os.getenv("PANORAMA_CA_BUNDLE")
+            or str(_panorama_file_settings.get("ca_bundle", ""))
+            or None
+        ),
         verify_ssl=(
             _parse_bool(value)
             if (value := os.getenv("PANORAMA_VERIFY_SSL")) is not None

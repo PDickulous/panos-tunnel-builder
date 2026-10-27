@@ -14,7 +14,7 @@ def test_loads_panorama_settings_from_toml(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(config_module, "load_dotenv", lambda: False)
+    monkeypatch.setattr(config_module, "load_dotenv", lambda **kwargs: False)
     config = tmp_path / "tunnels.toml"
     config.write_text(
         """
@@ -23,6 +23,7 @@ host = "panorama.example.test"
 api_key = "secret"
 port = 8443
 verify_ssl = false
+ca_bundle = "/example/private-ca.pem"
 
 [build]
 spoke_firewall = "branch-01"
@@ -35,6 +36,7 @@ hub_firewall = "hub-01"
         "PANORAMA_API_KEY",
         "PANORAMA_PORT",
         "PANORAMA_VERIFY_SSL",
+        "PANORAMA_CA_BUNDLE",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -46,12 +48,14 @@ hub_firewall = "hub-01"
     assert settings.panorama_api_key == "secret"
     assert settings.panorama_port == 8443
     assert settings.verify_ssl is False
+    assert settings.ca_bundle == "/example/private-ca.pem"
 
 
 def test_environment_overrides_panorama_file_settings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.chdir(tmp_path)
     config = tmp_path / "tunnels.toml"
     config.write_text(
         '[panorama]\nhost = "file-host"\napi_key = "file-key"\n',
@@ -60,11 +64,20 @@ def test_environment_overrides_panorama_file_settings(
     configure_from_file(config)
     monkeypatch.setenv("PANORAMA_HOST", "environment-host")
     monkeypatch.setenv("PANORAMA_API_KEY", "environment-key")
+    monkeypatch.setenv("PANORAMA_CA_BUNDLE", "/environment/ca.pem")
 
     settings = load_settings()
 
     assert settings.panorama_host == "environment-host"
     assert settings.panorama_api_key == "environment-key"
+    assert settings.ca_bundle == "/environment/ca.pem"
+
+
+def test_rejects_invalid_ca_bundle_type(tmp_path: Path) -> None:
+    config = tmp_path / "tunnels.toml"
+    config.write_text("[panorama]\nca_bundle = false\n", encoding="utf-8")
+    with pytest.raises(ConfigurationFileError, match="ca_bundle.*string"):
+        configure_from_file(config)
 
 
 def test_rejects_unknown_configuration_key(tmp_path: Path) -> None:
@@ -111,7 +124,7 @@ def test_rejects_invalid_panorama_port(tmp_path: Path, value: str) -> None:
 def test_rejects_invalid_environment_settings(
     monkeypatch: pytest.MonkeyPatch, name: str, value: str
 ) -> None:
-    monkeypatch.setattr(config_module, "load_dotenv", lambda: False)
+    monkeypatch.setattr(config_module, "load_dotenv", lambda **kwargs: False)
     configure_from_file(None)
     monkeypatch.setenv("PANORAMA_HOST", "example.test")
     monkeypatch.setenv("PANORAMA_API_KEY", "test-key")

@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "panos-tunnel-builder"
 version = "0.1.0"
 description = "Build and manage PAN-OS tunnels through Panorama."
+readme = "README-pypi.md"
 requires-python = ">=3.12"
 dependencies = [
     "pan-os-python>=1.13.1,<2",
@@ -15,12 +16,17 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "build>=1.2,<2",
     "mypy>=2.3,<3",
     "pyright>=1.1.411,<2",
     "pytest>=9.1,<10",
     "pytest-cov>=7.1,<8",
     "ruff>=0.16.1,<0.17",
 ]
+
+[project.urls]
+Repository = "https://github.com/PDickulous/panos-tunnel-builder"
+Documentation = "https://github.com/PDickulous/panos-tunnel-builder/tree/main/docs"
 
 [project.scripts]
 panos-tunnel-builder = "panos_tunnel_builder.cli:main"
