@@ -266,3 +266,13 @@ post-push checks; hub entries have no rename mapping. Stateful XML tests cover
 native reference updates, inherited references, stack overrides, preserved hub
 configuration, outside consumers, collisions, drift, and rollback. No live
 firewall validation of this optional feature has been performed.
+
+### Spoke ping-only management profile
+
+New spoke tunnels use `ping-only`. Tests cover detection of unrestricted ICMP-only
+profiles, all management-service toggles, IPv4/IPv6 permitted-IP coverage, inherited
+settings, profile creation/reuse/rename, existing reference updates, shared-scope
+checks, local conflicts, and unexpected candidate drift. Profile operations are
+verified inside the same recovery-snapshot and rollback boundary as the tunnel
+migration; interruptions and post-write failures trigger rollback. Hub definitions
+and assignments are preserved. Live Panorama validation has not been performed.

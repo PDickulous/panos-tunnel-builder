@@ -60,6 +60,21 @@ panos-tunnel-builder build branch-01 --hub-firewall hub-01 \
   --spoke-virtual-router-name "Branch VR" --load-candidate
 ```
 
+Every migration also prepares an interface-management profile named `ping-only`
+for the spokes and assigns it to the new spoke tunnel interfaces. The tool searches
+their contributing templates and stack overrides: it reuses a correct `ping-only`,
+renames a matching profile under another name, or creates one in the spoke owning
+template if no match exists. Renaming updates existing interface references while
+preserving their permissions. Hub profiles and assignments are preserved.
+
+Only ping may be enabled. The permitted-IP list must be empty or cover all IPv4
+and IPv6 addresses; an empty list has no source-IP restrictions, as documented by
+[Palo Alto Networks](https://docs.paloaltonetworks.com/ngfw/networking/configure-interfaces/use-interface-management-profiles-to-restrict-access).
+A conflicting `ping-only` profile, incompatible inheritance, local dependencies,
+or a rename affecting firewalls outside the spoke migration group blocks the load.
+Profile changes share the migration snapshot, verification, and rollback; preview
+mode displays the plan without writing configuration.
+
 Generated PSKs are hidden by default. `--show-secrets` displays them; the normal
 preview shows only fingerprints.
 

@@ -28,6 +28,7 @@ from panos_tunnel_builder.lsvpn import (
     SatelliteConfig,
     TunnelInterfaceInventory,
 )
+from panos_tunnel_builder.management_profiles import PingOnlyProfilePlan
 from panos_tunnel_builder.route_validation import RouteSnapshot
 from panos_tunnel_builder.router_rename import SpokeRouterRename
 
@@ -600,6 +601,8 @@ def test_build_reports_lsvpn_clone_plan(
     interrupted: str | None,
     rename_router: bool,
 ) -> None:
+    profiles = PingOnlyProfilePlan((), (), ("branch-stack",))
+    monkeypatch.setattr(cli, "prepare_ping_only_profiles", Mock(return_value=profiles))
     rename = (
         SpokeRouterRename("Branch VR", (("001122", "default"),), ())
         if rename_router
@@ -908,6 +911,8 @@ def test_build_reports_lsvpn_clone_plan(
     assert "Creates: hub-01-1 / hub-01-1-ike" in result.output
     assert "Hub endpoint: ethernet1/3 / 198.51.100.20/24" in result.output
     assert "Per-spoke tunnel plan" in result.output
+    assert "Spoke management profile" in result.output
+    assert 'New spoke tunnels: "ping-only"' in result.output
     assert "branch-01 (001122)" in result.output
     assert "WAN: ethernet1/1 / 203.0.113.13/24 -> 198.51.100.20" in result.output
     assert "Tunnel: spoke tunnel.1 (10.254.0.2/30) <-> hub tunnel.1" in result.output
@@ -930,6 +935,11 @@ def test_build_reports_lsvpn_clone_plan(
     assert load_candidate.call_args.args[8] is True
     assert load_candidate.call_count == 1
     assert load_candidate.call_args.kwargs["spoke_router_rename"] == rename
+    assert load_candidate.call_args.kwargs["ping_only_profiles"] == profiles
+    assert (
+        load_candidate.call_args.args[3][0].spoke.tunnel_interface.management_profile
+        == "ping-only"
+    )
     endpoints = json.loads(manifests[0].read_text())["endpoints"]
     assert endpoints[0]["virtual_router_map"] == (
         {"default": "Branch VR"} if rename_router else {}

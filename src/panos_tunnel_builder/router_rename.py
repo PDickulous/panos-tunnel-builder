@@ -50,6 +50,7 @@ def _config(
     serial: str | None = None,
     *,
     running: bool = False,
+    purpose: str = "router rename",
 ) -> ET.Element:
     operation = panorama.xapi.show if running else panorama.xapi.get
     options = {"extra_qs": {"target": serial}} if serial else {}
@@ -58,13 +59,11 @@ def _config(
         response.tag == "response" and response.get("status") != "success"
     ):
         raise LsvpnConfigurationError(
-            "Cannot verify full candidate configuration for router rename."
+            f"Cannot verify full configuration for {purpose}."
         )
     root = response if response.tag == "config" else response.find("./result/config")
     if root is None or not len(root):
-        raise LsvpnConfigurationError(
-            "Full candidate configuration is required for router rename."
-        )
+        raise LsvpnConfigurationError(f"Full configuration is required for {purpose}.")
     return deepcopy(root)
 
 
@@ -73,9 +72,11 @@ def _canonical(root: ET.Element) -> str:
     for node in copied.iter():
         for attribute in _METADATA:
             node.attrib.pop(attribute, None)
-    # Router and import order have no policy-order semantics. Native rename can
-    # move these entries; retain ordering everywhere else, including rulebases.
-    for parent in copied.findall(".//network/virtual-router"):
+    # Router, management-profile, and import order have no policy-order semantics.
+    # Native rename can move entries; retain ordering elsewhere, including rules.
+    unordered = copied.findall(".//network/virtual-router")
+    unordered.extend(copied.findall(".//profiles/interface-management-profile"))
+    for parent in unordered:
         if all(child.tag in {"entry", "member"} for child in parent):
             parent[:] = sorted(
                 parent, key=lambda child: (child.get("name", ""), child.text or "")

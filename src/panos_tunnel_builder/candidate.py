@@ -46,6 +46,12 @@ from .lsvpn import (
     StandardIpsecReplacementObjects,
     normalize_endpoint,
 )
+from .management_profiles import (
+    PING_ONLY,
+    PingOnlyProfilePlan,
+    apply_ping_only_profiles,
+    verify_ping_only_profiles,
+)
 from .router_rename import SpokeRouterRename, apply_spoke_router_rename
 
 TOOL_COMMENT_PREFIX = "Managed by panos-tunnel-builder; LSVPN source="
@@ -2028,6 +2034,7 @@ def _load_candidate_configuration_locked(
     allow_dirty_candidate: bool = False,
     on_snapshot_saved: Callable[[str], None] | None = None,
     spoke_router_rename: SpokeRouterRename | None = None,
+    ping_only_profiles: PingOnlyProfilePlan | None = None,
 ) -> CandidateLoadResult:
     """Save a rollback snapshot and load replacement objects without a commit."""
     if not (len(plans) == len(replacements) == len(placements)):
@@ -2051,6 +2058,8 @@ def _load_candidate_configuration_locked(
                 f'Replacement tunnel "{plan.tunnel_name}" still requires: '
                 f"{', '.join(plan.required_inputs)}."
             )
+        if ping_only_profiles is not None:
+            replacement.spoke.tunnel_interface.management_profile = PING_ONLY
         _prepare_endpoint_parents(
             panorama, replacement.spoke, placement.spoke, spoke_vsys
         )
@@ -2084,6 +2093,8 @@ def _load_candidate_configuration_locked(
         written = 0
         removed = 0
         removed_legacy_route_paths: list[str] = []
+        if ping_only_profiles is not None:
+            written += apply_ping_only_profiles(panorama, ping_only_profiles)
         written += _write_variables(panorama, variable_set)
         written_spokes: set[tuple[str, str, EndpointTemplatePlacement]] = set()
         for plan, replacement, placement, ownership in zip(
@@ -2143,6 +2154,8 @@ def _load_candidate_configuration_locked(
             tuple(removed_legacy_route_paths),
             variable_set,
         )
+        if ping_only_profiles is not None:
+            verify_ping_only_profiles(panorama, ping_only_profiles)
         if spoke_router_rename is not None:
             written += apply_spoke_router_rename(panorama, spoke_router_rename)
             for replacement in replacements:
@@ -2257,6 +2270,7 @@ def load_candidate_configuration(
     *,
     source_configuration: tuple[SourceConfigurationFingerprint, ...],
     spoke_router_rename: SpokeRouterRename | None = None,
+    ping_only_profiles: PingOnlyProfilePlan | None = None,
 ) -> CandidateLoadResult:
     """Load under temporary configuration and commit locks after checking jobs."""
     locks = _CandidateLocks()
@@ -2279,6 +2293,7 @@ def load_candidate_configuration(
             allow_dirty_candidate,
             on_snapshot_saved,
             spoke_router_rename,
+            ping_only_profiles,
         )
     except (Exception, KeyboardInterrupt, SystemExit) as load_error:
         cleanup_error = _release_candidate_locks(panorama, locks)

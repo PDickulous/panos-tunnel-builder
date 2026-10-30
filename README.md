@@ -7,6 +7,7 @@ configuration, and verifies routes after an operator commits and pushes.
 
 This version supports an optional spoke virtual-router rename, shared spoke templates,
 legacy virtual routers, advanced-routing logical-router VRFs, BGP, and OSPFv2.
+New spoke tunnels use an automatically prepared `ping-only` management profile.
 It does not create greenfield VPNs or commit or push configuration.
 
 ## Quick start

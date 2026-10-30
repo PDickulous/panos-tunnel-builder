@@ -2092,3 +2092,107 @@ def test_spoke_rename_name_matching_is_case_sensitive() -> None:
     assert rename.mapping("001122") == {"default": "Default"}
     router_rename.apply_spoke_router_rename(panorama, rename)
     assert xapi.rename.call_count == 3
+
+
+@pytest.mark.parametrize("failure", [None, "apply", "verify", "interrupt"])
+def test_ping_only_profile_updates_share_migration_snapshot_and_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str | None,
+) -> None:
+    from panos_tunnel_builder.management_profiles import PingOnlyProfilePlan
+
+    panorama, xapi = _panorama()
+    xapi.get.return_value = ET.fromstring("<response><result/></response>")
+    plan = _plan()
+    replacement = lsvpn.build_standard_ipsec_objects(plan)
+    events: list[str] = []
+
+    def snapshot(*args: object, **kwargs: object) -> str:
+        events.append("snapshot")
+        return "LSVPN_PRE_profiles.xml"
+
+    def apply(*args: object) -> int:
+        events.append("profile")
+        if failure == "apply":
+            raise lsvpn.LsvpnConfigurationError("profile write failed")
+        if failure == "interrupt":
+            raise KeyboardInterrupt()
+        return 1
+
+    def write(*args: object) -> int:
+        events.append("endpoint")
+        return 7
+
+    def verify(*args: object) -> None:
+        events.append("verify-profile")
+        if failure == "verify":
+            raise lsvpn.LsvpnConfigurationError("profile verification failed")
+
+    monkeypatch.setattr(candidate, "save_pre_migration_snapshot", snapshot)
+    monkeypatch.setattr(candidate, "apply_ping_only_profiles", apply)
+    monkeypatch.setattr(candidate, "_write_endpoint", write)
+    monkeypatch.setattr(candidate, "verify_candidate_configuration", Mock())
+    monkeypatch.setattr(candidate, "verify_ping_only_profiles", verify)
+    rollback = Mock()
+    monkeypatch.setattr(candidate, "rollback_candidate_configuration", rollback)
+    profile_plan = PingOnlyProfilePlan((), (), ("spoke-stack",))
+
+    def load() -> candidate.CandidateLoadResult:
+        return candidate.load_candidate_configuration(
+            panorama,
+            "branch",
+            (plan,),
+            (replacement,),
+            (_placement(),),
+            allow_dirty_candidate=True,
+            source_configuration=(),
+            ping_only_profiles=profile_plan,
+        )
+
+    if failure:
+        error = (
+            candidate.CandidateLoadInterrupted
+            if failure == "interrupt"
+            else candidate.CandidateLoadError
+        )
+        with pytest.raises(error, match="rolled back"):
+            load()
+        rollback.assert_called_once()
+    else:
+        result = load()
+        assert result.created_or_updated_objects == 15
+        assert not rollback.called
+        assert events == [
+            "snapshot",
+            "profile",
+            "endpoint",
+            "endpoint",
+            "verify-profile",
+        ]
+    assert events[:2] == ["snapshot", "profile"]
+    assert replacement.spoke.tunnel_interface.management_profile == "ping-only"
+    assert replacement.hub.tunnel_interface.management_profile is None
+    assert not xapi.commit.called
+
+
+def test_management_profile_preview_assigns_only_spoke_tunnels() -> None:
+    from unittest.mock import patch
+
+    from panos_tunnel_builder import cli
+    from panos_tunnel_builder.management_profiles import PingOnlyProfilePlan
+
+    plan = _plan()
+    replacement = lsvpn.build_standard_ipsec_objects(plan)
+    profile_plan = PingOnlyProfilePlan((), (), ("spoke-stack",))
+    panorama, xapi = _panorama()
+    with patch.object(cli, "prepare_ping_only_profiles", return_value=profile_plan):
+        result = cli._prepare_spoke_management_profiles(
+            panorama,
+            (_rename_inventory(),),
+            "spoke-template",
+            (replacement,),
+        )
+    assert result == profile_plan
+    assert replacement.spoke.tunnel_interface.management_profile == "ping-only"
+    assert replacement.hub.tunnel_interface.management_profile is None
+    assert not xapi.set.called and not xapi.rename.called

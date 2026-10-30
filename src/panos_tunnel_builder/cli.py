@@ -64,6 +64,11 @@ from .lsvpn import (
     select_single_portal_gateway,
     stage_standard_ipsec_objects,
 )
+from .management_profiles import (
+    PING_ONLY,
+    PingOnlyProfilePlan,
+    prepare_ping_only_profiles,
+)
 from .panorama_client import create_panorama
 from .route_validation import (
     MigrationEndpointValidation,
@@ -1164,6 +1169,7 @@ def _build_shared_migration(
                 tunnel_sequence=satellite_index + 1,
             )
             replacement = build_standard_ipsec_objects(plan, shared_spoke_names=True)
+            replacement.spoke.tunnel_interface.management_profile = PING_ONLY
             planned.append(SharedSpokeReplacement(spoke, plan, replacement))
             global_index += 1
 
@@ -1505,6 +1511,7 @@ def _load_shared_candidate(
     snapshot_directory: Path,
     source_configuration: tuple[SourceConfigurationFingerprint, ...],
     spoke_router_rename: SpokeRouterRename | None,
+    ping_only_profiles: PingOnlyProfilePlan | None,
 ) -> None:
     clone_plans = shared_build.plans
     replacements = shared_build.replacements
@@ -1605,6 +1612,7 @@ def _load_shared_candidate(
             ),
             source_configuration=tuple(source_configuration),
             spoke_router_rename=spoke_router_rename,
+            ping_only_profiles=ping_only_profiles,
         )
     spoke_safe_name = re.sub(r"[^A-Za-z0-9_.-]", "-", inventory.firewall_name)
     manifest_path = snapshot_directory / (
@@ -1613,6 +1621,34 @@ def _load_shared_candidate(
     _finish_candidate_load(
         candidate_result, manifest, manifest_path, route_snapshot_paths
     )
+
+
+def _prepare_spoke_management_profiles(
+    panorama: Panorama,
+    spokes: tuple[FirewallTemplateInventory, ...],
+    creation_template: str | None,
+    replacements: tuple[StandardIpsecReplacementObjects, ...],
+) -> PingOnlyProfilePlan | None:
+    if not replacements:
+        return None
+    if creation_template is None:
+        raise LsvpnConfigurationError(
+            "A spoke template is required for management profiles."
+        )
+    plan = prepare_ping_only_profiles(panorama, spokes, creation_template)
+    for replacement in replacements:
+        replacement.spoke.tunnel_interface.management_profile = PING_ONLY
+    _heading("Spoke management profile")
+    for old in plan.source_names:
+        typer.echo(
+            f'  Rename "{old}" to "{PING_ONLY}" and update interface references.'
+        )
+    if plan.creations:
+        typer.echo(f'  Create "{PING_ONLY}" in spoke template "{creation_template}".')
+    if not plan.renames and not plan.creations:
+        typer.echo(f'  Reuse existing "{PING_ONLY}".')
+    typer.echo(f'  New spoke tunnels: "{PING_ONLY}" (ping only, any source address).')
+    return plan
 
 
 def _prepare_spoke_router_option(
@@ -1900,6 +1936,9 @@ def build(
         )
         clone_plans = list(shared_build.plans)
         replacements = list(shared_build.replacements)
+        ping_only_profiles = _prepare_spoke_management_profiles(
+            panorama, spoke_inventories, satellite_template, tuple(replacements)
+        )
         spoke_router_rename = _prepare_spoke_router_option(
             panorama,
             spoke_inventories,
@@ -1948,6 +1987,7 @@ def build(
                 snapshot_directory,
                 tuple(source_configuration),
                 spoke_router_rename,
+                ping_only_profiles,
             )
 
     except typer.Abort:

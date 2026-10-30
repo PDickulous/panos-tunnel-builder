@@ -291,3 +291,21 @@ verified load, the CLI reports the remote state before atomically publishing the
 manifest. Artifact publication or lock-cleanup failures return nonzero while
 preserving the verified candidate and recovery baselines; they do not trigger a
 new rollback.
+
+## Spoke interface-management profiles
+
+`management_profiles.py` prepares the canonical `ping-only` profile across spoke
+template stacks, evaluating inherited service settings and permitted-IP lists.
+It does not infer unrestricted access by combining restricted lists from different
+template layers.
+It renames a matching profile and its interface references or creates an explicit
+ping-enabled, all-other-services-disabled profile without source-IP restrictions.
+A correct existing canonical profile is reused. The new spoke tunnels reference
+this profile before shared-template compatibility checks; hub settings are copied
+from their source as before.
+
+Planning checks ownership, local dependencies, conflicting canonical names, and
+consumers outside the selected spoke group. Profile mutations run after the
+recovery snapshot and before tunnel writes. The loader verifies the entire
+candidate against the expected profile/reference changes and checks the effective
+profile again after the tunnel migration. Any failure uses the existing rollback.
