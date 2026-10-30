@@ -1,3 +1,4 @@
+import json
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -28,6 +29,7 @@ from panos_tunnel_builder.lsvpn import (
     TunnelInterfaceInventory,
 )
 from panos_tunnel_builder.route_validation import RouteSnapshot
+from panos_tunnel_builder.router_rename import SpokeRouterRename
 
 runner = CliRunner()
 
@@ -575,6 +577,7 @@ def test_build_rejects_hub_stack_without_interface_template(
     assert "no templates containing interface configuration" in result.output
 
 
+@pytest.mark.parametrize("rename_router", [False, True])
 @pytest.mark.parametrize("from_file", [False, True])
 @pytest.mark.parametrize(
     "interrupted",
@@ -595,7 +598,14 @@ def test_build_reports_lsvpn_clone_plan(
     tmp_path: Path,
     from_file: bool,
     interrupted: str | None,
+    rename_router: bool,
 ) -> None:
+    rename = (
+        SpokeRouterRename("Branch VR", (("001122", "default"),), ())
+        if rename_router
+        else None
+    )
+    monkeypatch.setattr(cli, "prepare_spoke_router_rename", Mock(return_value=rename))
     source_capture = Mock(
         side_effect=lambda _p, serial=None: SourceConfigurationFingerprint(
             serial, "candidate", "running"
@@ -715,6 +725,9 @@ def test_build_reports_lsvpn_clone_plan(
                 "vsys1",
                 "2026-08-19T12:00:00+00:00",
                 (),
+                captured_routing_instances=(
+                    RoutingInstanceConfig("virtual-router", "default"),
+                ),
             ),
             RouteSnapshot(
                 1,
@@ -723,6 +736,9 @@ def test_build_reports_lsvpn_clone_plan(
                 "vsys1",
                 "2026-08-19T12:00:00+00:00",
                 (),
+                captured_routing_instances=(
+                    RoutingInstanceConfig("virtual-router", "default"),
+                ),
             ),
         )
     )
@@ -803,7 +819,8 @@ def test_build_reports_lsvpn_clone_plan(
         config = tmp_path / "tunnels.toml"
         config.write_text(
             f'[build]\nmigration_artifact_directory = "{tmp_path}"\n'
-            "allow_pending_candidate_changes = true\n",
+            "allow_pending_candidate_changes = true\n"
+            + ('spoke_virtual_router_name = "Branch VR"\n' if rename_router else ""),
             encoding="utf-8",
         )
         prefix = ["--config", str(config)]
@@ -829,6 +846,11 @@ def test_build_reports_lsvpn_clone_plan(
             "--hub-template-number",
             "2",
             "--load-candidate",
+            *(
+                ["--spoke-virtual-router-name", "Branch VR"]
+                if rename_router and not from_file
+                else []
+            ),
             *artifact_flags,
             "--yes",
         ],
@@ -907,6 +929,12 @@ def test_build_reports_lsvpn_clone_plan(
     assert discover_placements.call_count == 1
     assert load_candidate.call_args.args[8] is True
     assert load_candidate.call_count == 1
+    assert load_candidate.call_args.kwargs["spoke_router_rename"] == rename
+    endpoints = json.loads(manifests[0].read_text())["endpoints"]
+    assert endpoints[0]["virtual_router_map"] == (
+        {"default": "Branch VR"} if rename_router else {}
+    )
+    assert endpoints[1]["virtual_router_map"] == {}
     assert [call.args[1:] for call in source_capture.call_args_list] == [
         (),
         ("001122",),
@@ -1549,3 +1577,16 @@ def test_build_captures_shared_sources_before_discovery_reads(
         "capture:003344",
         "plan",
     ]
+
+
+def test_invalid_spoke_router_name_fails_before_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Mock()
+    monkeypatch.setattr(cli, "load_settings", settings)
+    result = runner.invoke(
+        cli.app, ["build", "branch-01", "--spoke-virtual-router-name", "invalid/name"]
+    )
+    assert result.exit_code == 1
+    assert "1 to 31" in result.output
+    assert not settings.called

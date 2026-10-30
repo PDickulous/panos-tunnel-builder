@@ -247,3 +247,22 @@ exercised against live Panorama during the September 30 review. A lab
 candidate-load check and operator-controlled post-commit route verification
 remain appropriate before production use. Candidate verification alone does not
 establish forwarding or application connectivity.
+
+### Optional spoke virtual-router rename
+
+`--spoke-virtual-router-name` validates names, router ownership, stack assignments,
+target-name collisions, local candidate/running router definitions and references
+that would retain the old name, and every consumer of a changed template before candidate loading. It refuses to merge
+routers or rename logical-router VRFs. The migration's shared spoke group must
+include all consumers; a hub or unrelated firewall consumer blocks the rename.
+
+After the normal tunnel-migration checks, the loader uses the native rename API
+for every source router fragment, updates cross-template imports and `next-vr`
+references, and rereads the full candidate. Only the planned router names and
+references may differ, ignoring Panorama metadata and unordered router/import
+lists. Verification failure or interruption invokes the existing rollback.
+Spoke manifest entries map router identities and next-router references during
+post-push checks; hub entries have no rename mapping. Stateful XML tests cover
+native reference updates, inherited references, stack overrides, preserved hub
+configuration, outside consumers, collisions, drift, and rollback. No live
+firewall validation of this optional feature has been performed.

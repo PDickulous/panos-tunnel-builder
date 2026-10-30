@@ -3,7 +3,8 @@ import json
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+from dataclasses import field as dataclass_field
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
@@ -16,6 +17,7 @@ from .lsvpn import (
     _read_effective_running_config,
 )
 from .panorama_client import Firewall
+from .router_rename import map_router_references
 
 ROUTE_SNAPSHOT_SCHEMA_VERSION = 2
 MANIFEST_SCHEMA_VERSION = 1
@@ -170,6 +172,7 @@ class MigrationEndpointValidation:
     allowed_added_prefixes: tuple[str, ...]
     mutable_routing_interfaces: tuple[str, ...] = ()
     mutable_route_names: tuple[str, ...] = ()
+    virtual_router_map: dict[str, str] = dataclass_field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -237,7 +240,16 @@ def _migration_endpoint_from_dict(value: Any) -> MigrationEndpointValidation:
         isinstance(item, str) for item in mutable_route_names
     ):
         raise RouteValidationError("Mutable route names must be a JSON array.")
+    router_map = value.get("virtual_router_map", {})
+    if not isinstance(router_map, dict) or any(
+        not isinstance(k, str) or not k or not isinstance(v, str) or not v
+        for k, v in router_map.items()
+    ):
+        raise RouteValidationError(
+            "Virtual router mappings must contain non-empty strings."
+        )
     return MigrationEndpointValidation(
+        virtual_router_map=router_map,
         role=cast(Literal["spoke", "hub"], role),
         firewall_name=str(value["firewall_name"]),
         serial=str(value["serial"]),
@@ -924,6 +936,7 @@ def _normalized_routing_configuration(
     entries: tuple[str, ...],
     mutable_interfaces: tuple[str, ...],
     mutable_route_names: tuple[str, ...],
+    virtual_router_map: dict[str, str] | None = None,
 ) -> dict[tuple[str, str], str]:
     interfaces = {value.strip().casefold() for value in mutable_interfaces}
     route_names = {value.casefold() for value in mutable_route_names}
@@ -941,6 +954,9 @@ def _normalized_routing_configuration(
                 f"Invalid routing configuration XML in route snapshot: {exc}"
             ) from exc
         _strip_metadata(entry)
+        map_router_references(entry, virtual_router_map or {})
+        if kind == "virtual-router" and entry.get("name") in (virtual_router_map or {}):
+            entry.set("name", (virtual_router_map or {})[entry.get("name", "")])
 
         for container in entry.findall(".//interface"):
             _remove_children_matching(
@@ -1012,6 +1028,10 @@ def _normalized_routing_configuration(
                         parent.remove(child)
                         changed = True
         key = (kind, entry.get("name", ""))
+        if key in normalized:
+            raise RouteValidationError(
+                "Virtual router mapping merges routing configurations."
+            )
         normalized[key] = ET.canonicalize(
             ET.tostring(entry, encoding="unicode"),
             strip_text=True,
@@ -1025,6 +1045,7 @@ def compare_routing_configurations(
     *,
     mutable_interfaces: tuple[str, ...] = (),
     mutable_route_names: tuple[str, ...] = (),
+    virtual_router_map: dict[str, str] | None = None,
 ) -> tuple[str, ...]:
     """Return routing instances with changes outside the approved migration scope."""
     if before.serial != after.serial or before.vsys != after.vsys:
@@ -1038,6 +1059,7 @@ def compare_routing_configurations(
         before.routing_configuration,
         mutable_interfaces,
         mutable_route_names,
+        virtual_router_map,
     )
     after_entries = _normalized_routing_configuration(
         after.routing_configuration,
@@ -1092,6 +1114,7 @@ def compare_route_snapshots(
     path_mappings: tuple[RoutePathMapping, ...] = (),
     allowed_added_prefixes: tuple[str, ...] = (),
     allow_additional_candidates: bool = False,
+    virtual_router_map: dict[str, str] | None = None,
 ) -> RouteComparison:
     """Compare stable RIB attributes, optionally mapping expected replacements."""
     if before.serial != after.serial or before.vsys != after.vsys:
@@ -1100,7 +1123,25 @@ def compare_route_snapshots(
         )
     _assert_snapshot_coverage(before)
     _assert_snapshot_coverage(after)
-    if set(before.captured_routing_instances) != set(after.captured_routing_instances):
+    router_map = virtual_router_map or {}
+    legacy_names = {
+        item.name
+        for item in before.captured_routing_instances
+        if item.kind == "virtual-router"
+    }
+    if set(router_map) - legacy_names:
+        raise RouteValidationError(
+            "Virtual router mapping names a router absent from the baseline."
+        )
+    mapped_instances = {
+        replace(item, name=router_map.get(item.name, item.name))
+        if item.kind == "virtual-router"
+        else item
+        for item in before.captured_routing_instances
+    }
+    if len(mapped_instances) != len(before.captured_routing_instances):
+        raise RouteValidationError("Virtual router mapping merges routing instances.")
+    if mapped_instances != set(after.captured_routing_instances):
         raise RouteValidationError(
             "The captured routing instances differ between route snapshots."
         )
@@ -1115,7 +1156,14 @@ def compare_route_snapshots(
     }
     mapped_before = tuple(
         _mapped_route(
-            route,
+            replace(
+                route,
+                routing_instance=router_map.get(
+                    route.routing_instance, route.routing_instance
+                ),
+            )
+            if route.routing_kind == "virtual-router"
+            else route,
             normalized_prefix_map,
             interface_map or {},
             normalized_next_hop_map,

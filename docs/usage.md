@@ -34,8 +34,31 @@ with `--spoke-vsys` and `--hub-vsys`.
 Review the full shared-template scope: all spokes inheriting the satellite's
 owning template must migrate together. The pool must have room for one IPv4
 `/30` or IPv6 `/127` per tunnel without overlapping existing interface networks.
-Existing router names are preserved. If no LSVPN satellite remains, a load
-request completes as a no-op; greenfield tunnels are not created.
+Router names are preserved by default. Add
+`--spoke-virtual-router-name "Branch VR"` (or set
+`build.spoke_virtual_router_name` in TOML) to rename each migrated spoke's existing
+legacy virtual router when its name differs. The preview displays each rename;
+`--load-candidate` applies it after loading and verifying the tunnel migration.
+The hub router keeps its existing name. Names are case-sensitive and contain
+1–31 letters, numbers, spaces, hyphens, or underscores, without leading or
+trailing spaces. See the vendor's [virtual-router name requirements](https://docs.paloaltonetworks.com/ngfw/help/10-1/network/network-virtual-routers/general-settings-of-a-virtual-router).
+
+The rename retains the full router configuration, updates router imports and
+`next-vr` references across contributing templates and stack overrides, and is
+included in the recovery snapshot and validation manifest. Every firewall
+inheriting a changed template must belong to the spoke migration group; isolate
+other consumers before renaming. Local firewall router settings or references
+that retain the old name must first be moved into Panorama templates; both local
+candidate and running configuration are checked. Existing target names, multiple
+source routers on one spoke, and logical-router/VRF renames are rejected. A matching name needs
+no rename. If no LSVPN satellite remains, a load request completes as a no-op;
+greenfield tunnels and standalone router renames are not created.
+
+```bash
+panos-tunnel-builder build branch-01 --hub-firewall hub-01 \
+  --tunnel-address-pool 10.254.0.0/24 \
+  --spoke-virtual-router-name "Branch VR" --load-candidate
+```
 
 Generated PSKs are hidden by default. `--show-secrets` displays them; the normal
 preview shows only fingerprints.
@@ -299,3 +322,7 @@ panos-tunnel-builder candidate restore --help
 
 Use `--config FILE.toml` before the command name to supply
 [TOML defaults](configuration.md#toml-command-defaults).
+
+When comparing snapshots manually after a router rename, include
+`routes compare before.json after.json --virtual-router-map "default=Branch VR"`.
+The migration verifier reads this mapping from the spoke's manifest entry.

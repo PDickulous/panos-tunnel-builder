@@ -46,6 +46,7 @@ from .lsvpn import (
     StandardIpsecReplacementObjects,
     normalize_endpoint,
 )
+from .router_rename import SpokeRouterRename, apply_spoke_router_rename
 
 TOOL_COMMENT_PREFIX = "Managed by panos-tunnel-builder; LSVPN source="
 PANORAMA_METADATA_ATTRIBUTES = frozenset({"admin", "dirtyId", "time"})
@@ -2026,6 +2027,7 @@ def _load_candidate_configuration_locked(
     variables: CandidateVariableSet | None = None,
     allow_dirty_candidate: bool = False,
     on_snapshot_saved: Callable[[str], None] | None = None,
+    spoke_router_rename: SpokeRouterRename | None = None,
 ) -> CandidateLoadResult:
     """Save a rollback snapshot and load replacement objects without a commit."""
     if not (len(plans) == len(replacements) == len(placements)):
@@ -2141,6 +2143,10 @@ def _load_candidate_configuration_locked(
             tuple(removed_legacy_route_paths),
             variable_set,
         )
+        if spoke_router_rename is not None:
+            written += apply_spoke_router_rename(panorama, spoke_router_rename)
+            for replacement in replacements:
+                replacement.spoke.routing_object.name = spoke_router_rename.new_name
     except (Exception, KeyboardInterrupt, SystemExit) as load_error:
         interrupted = isinstance(load_error, (KeyboardInterrupt, SystemExit))
         error_type = CandidateLoadInterrupted if interrupted else CandidateLoadError
@@ -2250,6 +2256,7 @@ def load_candidate_configuration(
     on_snapshot_saved: Callable[[str], None] | None = None,
     *,
     source_configuration: tuple[SourceConfigurationFingerprint, ...],
+    spoke_router_rename: SpokeRouterRename | None = None,
 ) -> CandidateLoadResult:
     """Load under temporary configuration and commit locks after checking jobs."""
     locks = _CandidateLocks()
@@ -2271,6 +2278,7 @@ def load_candidate_configuration(
             variables,
             allow_dirty_candidate,
             on_snapshot_saved,
+            spoke_router_rename,
         )
     except (Exception, KeyboardInterrupt, SystemExit) as load_error:
         cleanup_error = _release_candidate_locks(panorama, locks)

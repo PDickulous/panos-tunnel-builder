@@ -7,7 +7,7 @@
 Version 0.1.0 targets migration of existing LSVPN deployments to standard IPsec
 through Panorama. It supports shared spoke templates, legacy virtual routers,
 logical-router VRFs, IPv4/IPv6 BGP, and IPv4 OSPFv2. Existing router names are
-preserved. See [architecture](architecture.md) for supported routing topologies.
+preserved by default, with an optional spoke-only legacy virtual-router rename. See [architecture](architecture.md) for supported routing topologies.
 
 ## Operator responsibilities
 

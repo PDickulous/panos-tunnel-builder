@@ -3,8 +3,13 @@
 [Documentation index](../README.md#documentation)
 
 The CLI discovers LSVPN deployments, constructs paired IPsec replacements, and
-optionally writes a verified Panorama candidate transaction. Router names remain
-unchanged. For operator commands see [usage](usage.md); for transaction diagrams,
+optionally writes a verified Panorama candidate transaction. Router names are
+preserved by default; an optional spoke-only virtual-router rename runs inside
+the same snapshot, locking, and rollback boundary after migration verification.
+It renames complete router objects in contributing templates and stack overrides,
+repairs imports and next-router references, and verifies the entire Panorama
+candidate against the expected changes. Spoke manifests carry the old-to-new
+router mapping for subsequent RIB and routing-configuration comparisons. For operator commands see [usage](usage.md); for transaction diagrams,
 code/test links, and verification boundaries see [validation](validation.md).
 
 ## Firewall and template discovery

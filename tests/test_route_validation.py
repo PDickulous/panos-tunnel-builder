@@ -708,3 +708,131 @@ def test_manifest_rejects_empty_or_invalid_endpoints(endpoints: object) -> None:
         MigrationValidationManifest.from_json(
             json.dumps({"schema_version": 1, "endpoints": endpoints})
         )
+
+
+def test_virtual_router_rename_maps_routes_and_configuration() -> None:
+    route = replace(
+        _route(), routing_kind="virtual-router", routing_instance="old", vrf=None
+    )
+    before = replace(
+        _snapshot(route),
+        captured_routing_instances=(RoutingInstanceConfig("virtual-router", "old"),),
+        routing_configuration=(
+            'virtual-router\0<entry name="old"><interface>'
+            "<member>ethernet1/1</member></interface></entry>",
+        ),
+    )
+    after = replace(
+        before,
+        routes=(replace(route, routing_instance="new"),),
+        captured_routing_instances=(RoutingInstanceConfig("virtual-router", "new"),),
+        routing_configuration=(
+            'virtual-router\0<entry name="new"><interface>'
+            "<member>ethernet1/1</member></interface></entry>",
+        ),
+    )
+    mapping = {"old": "new"}
+    comparison = route_validation.compare_route_snapshots(
+        before, after, virtual_router_map=mapping
+    )
+    assert not comparison.missing and not comparison.added and not comparison.changed
+    assert not route_validation.compare_routing_configurations(
+        before, after, virtual_router_map=mapping
+    )
+    with pytest.raises(RouteValidationError, match="routing instances differ"):
+        route_validation.compare_route_snapshots(before, after)
+
+
+def test_router_rename_maps_route_leaks_and_detects_other_drift() -> None:
+    before = replace(
+        _snapshot(),
+        routing_configuration=(
+            'virtual-router\0<entry name="other"><routing-table><ip><static-route>'
+            '<entry name="leak"><nexthop><next-vr>old</next-vr></nexthop>'
+            "</entry></static-route></ip></routing-table></entry>",
+        ),
+    )
+    after = replace(
+        before,
+        routing_configuration=tuple(
+            xml.replace("<next-vr>old</next-vr>", "<next-vr>new</next-vr>")
+            for xml in before.routing_configuration
+        ),
+    )
+    assert not route_validation.compare_routing_configurations(
+        before, after, virtual_router_map={"old": "new"}
+    )
+    drift = replace(
+        after,
+        routing_configuration=tuple(
+            xml.replace('name="leak"', 'name="changed"')
+            for xml in after.routing_configuration
+        ),
+    )
+    assert route_validation.compare_routing_configurations(
+        before, drift, virtual_router_map={"old": "new"}
+    ) == ("virtual-router:other",)
+
+
+def test_router_mapping_cannot_merge_instances_or_name_unknown_routers() -> None:
+    before = replace(
+        _snapshot(),
+        captured_routing_instances=(
+            RoutingInstanceConfig("virtual-router", "old"),
+            RoutingInstanceConfig("virtual-router", "new"),
+        ),
+    )
+    after = replace(
+        before,
+        captured_routing_instances=(RoutingInstanceConfig("virtual-router", "new"),),
+    )
+    with pytest.raises(RouteValidationError, match="merges routing instances"):
+        route_validation.compare_route_snapshots(
+            before, after, virtual_router_map={"old": "new"}
+        )
+    with pytest.raises(RouteValidationError, match="absent from the baseline"):
+        route_validation.compare_route_snapshots(
+            before, before, virtual_router_map={"typo": "new"}
+        )
+
+
+def test_route_compare_cli_accepts_virtual_router_mapping(tmp_path: Path) -> None:
+    before = replace(
+        _snapshot(),
+        captured_routing_instances=(RoutingInstanceConfig("virtual-router", "old"),),
+    )
+    after = replace(
+        before,
+        captured_routing_instances=(RoutingInstanceConfig("virtual-router", "new"),),
+    )
+    baseline = tmp_path / "before.json"
+    current = tmp_path / "after.json"
+    baseline.write_text(before.to_json())
+    current.write_text(after.to_json())
+    result = runner.invoke(
+        cli.app,
+        [
+            "routes",
+            "compare",
+            str(baseline),
+            str(current),
+            "--virtual-router-map",
+            "old=new",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+
+@pytest.mark.parametrize("mapping", [[], "old=new", {"old": ""}, {"old": 1}])
+def test_manifest_rejects_invalid_virtual_router_mapping(mapping: object) -> None:
+    endpoint = MigrationEndpointValidation(
+        "spoke", "branch", "001122", "vsys1", "baseline.json", {}, (), ()
+    )
+    from dataclasses import asdict
+
+    document = asdict(endpoint)
+    document["virtual_router_map"] = mapping
+    with pytest.raises(RouteValidationError, match="Virtual router mappings"):
+        MigrationValidationManifest.from_json(
+            json.dumps({"schema_version": 1, "endpoints": [document]})
+        )

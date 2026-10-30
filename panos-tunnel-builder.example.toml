@@ -18,6 +18,9 @@ hub_template_name = "hub-network"
 # Set a name OR a menu number for each endpoint, not both.
 spoke_vsys = "vsys1"
 hub_vsys = "vsys1"
+# Optional: rename each migrated spoke's existing legacy virtual router.
+# Hub router names are preserved; matching spoke names require no rename.
+# spoke_virtual_router_name = "Branch VR"
 tunnel_address_pool = "10.254.0.0/24"
 migration_artifact_directory = "migration-snapshots"
 show_secrets = false
@@ -38,6 +41,7 @@ after = "after.json"
 prefix_map = ["10.0.0.0/30=10.1.0.0/30"]
 interface_map = ["tunnel.2=tunnel.3"]
 next_hop_map = ["10.0.0.1=10.1.0.1"]
+# virtual_router_map = ["default=Branch VR"]
 
 [routes.verify-migration]
 manifest_file = "migration-validation.json"

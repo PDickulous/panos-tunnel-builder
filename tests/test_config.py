@@ -154,3 +154,14 @@ def test_rejects_invalid_confirmation_setting(
 
     with pytest.raises(ConfigurationFileError):
         configure_from_file(config)
+
+
+def test_spoke_virtual_router_name_configuration(tmp_path: Path) -> None:
+    path = tmp_path / "rename.toml"
+    path.write_text('[build]\nspoke_virtual_router_name = "Branch VR"\n')
+    assert (
+        configure_from_file(path)["build"]["spoke_virtual_router_name"] == "Branch VR"
+    )
+    path.write_text("[build]\nspoke_virtual_router_name = 123\n")
+    with pytest.raises(ConfigurationFileError, match="must be a string"):
+        configure_from_file(path)

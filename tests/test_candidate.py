@@ -1,4 +1,5 @@
 import xml.etree.ElementTree as ET
+from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime
 from unittest.mock import Mock
@@ -6,7 +7,8 @@ from unittest.mock import Mock
 import pytest
 from panos.panorama import Panorama
 
-from panos_tunnel_builder import candidate, lsvpn
+from panos_tunnel_builder import candidate, lsvpn, router_rename
+from panos_tunnel_builder.inventory import FirewallTemplateInventory, TemplateCandidate
 
 
 @pytest.fixture(autouse=True)
@@ -1647,3 +1649,446 @@ def test_post_write_verification_blocks_missing_object_and_hub_change(
 
     assert "missing spoke" in str(exc_info.value)
     assert "hub LSVPN" in str(exc_info.value)
+
+
+def _required(root: ET.Element, xpath: str) -> ET.Element:
+    result = root.find(xpath)
+    assert result is not None, xpath
+    return result
+
+
+def _rename_inventory() -> FirewallTemplateInventory:
+    return FirewallTemplateInventory(
+        "branch-01",
+        "001122",
+        "spoke-stack",
+        (
+            TemplateCandidate("spoke-base", ()),
+            TemplateCandidate("spoke-template", ("tunnel.2",)),
+        ),
+    )
+
+
+def _rename_config() -> ET.Element:
+    return ET.fromstring("""<config><devices><entry name="localhost.localdomain">
+      <template>
+        <entry name="spoke-base"><config><devices><entry name="localhost.localdomain">
+          <network><virtual-router>
+            <entry name="default"><protocol><bgp><enable>yes</enable></bgp>
+          </protocol></entry>
+            <entry name="other"><routing-table><ip><static-route><entry name="leak">
+              <destination>10.0.0.0/8</destination><nexthop>
+          <next-vr>default</next-vr></nexthop>
+            </entry></static-route></ip></routing-table></entry>
+          </virtual-router></network>
+        </entry></devices></config></entry>
+        <entry name="spoke-template"><config><devices>
+          <entry name="localhost.localdomain">
+          <network><virtual-router><entry name="default"><interface>
+          <member>tunnel.2</member>
+          <member>ethernet1/1</member></interface></entry></virtual-router></network>
+          <vsys><entry name="vsys1"><import><network><virtual-router>
+            <member>default</member><member>other</member>
+          </virtual-router></network></import></entry></vsys>
+        </entry></devices></config></entry>
+        <entry name="hub-template"><config><devices><entry name="localhost.localdomain">
+          <network><virtual-router><entry name="default"><interface>
+          <member>tunnel.10</member></interface></entry></virtual-router></network>
+        </entry></devices></config></entry>
+      </template>
+      <template-stack>
+        <entry name="spoke-stack"><templates><member>spoke-base</member>
+          <member>spoke-template</member></templates><devices>
+          <entry name="001122"/></devices>
+          <config><devices><entry name="localhost.localdomain"><network><virtual-router>
+            <entry name="default"><ecmp><enable>yes</enable></ecmp></entry>
+          </virtual-router></network></entry></devices></config>
+        </entry>
+        <entry name="hub-stack"><templates><member>hub-template</member></templates>
+          <devices><entry name="998877"/></devices></entry>
+      </template-stack>
+    </entry></devices></config>""")
+
+
+def _xml_xapi(root: ET.Element, auto_references: bool = False) -> tuple[Panorama, Mock]:
+    panorama, xapi = _panorama()
+
+    def get(path: str, **kwargs: object) -> ET.Element:
+        assert path == "/config"
+        response = ET.Element("response", status="success")
+        if "extra_qs" in kwargs:
+            ET.SubElement(response, "result").append(
+                ET.fromstring(
+                    "<config><devices><entry><network/></entry></devices></config>"
+                )
+            )
+        else:
+            ET.SubElement(response, "result").append(deepcopy(root))
+        return response
+
+    def rename(path: str, new: str) -> None:
+        node = _required(root, "." + path.removeprefix("/config"))
+        assert node is not None, path
+        old = node.get("name", "")
+        node.set("name", new)
+        if auto_references:
+            template = next(
+                entry
+                for entry in root.findall(".//template/entry")
+                + root.findall(".//template-stack/entry")
+                if node in entry.iter()
+            )
+            router_rename.map_router_references(template, {old: new})
+
+    def edit(path: str, xml: str) -> None:
+        node = _required(root, "." + path.removeprefix("/config"))
+        assert node is not None, path
+        replacement = ET.fromstring(xml)
+        node.attrib.clear()
+        node.attrib.update(replacement.attrib)
+        node.text = replacement.text
+        node[:] = list(replacement)
+
+    xapi.get.side_effect = get
+    xapi.show.return_value = ET.fromstring(
+        '<response status="success"><result><config><devices><entry>'
+        "<network/></entry></devices></config></result></response>"
+    )
+    xapi.rename.side_effect = rename
+    xapi.edit.side_effect = edit
+    return panorama, xapi
+
+
+@pytest.mark.parametrize("auto_references", [False, True])
+def test_spoke_rename_preserves_full_router_and_repairs_inherited_references(
+    auto_references: bool,
+) -> None:
+    root = _rename_config()
+    hub_before = ET.tostring(_required(root, ".//template/entry[@name='hub-template']"))
+    panorama, xapi = _xml_xapi(root, auto_references)
+    rename = router_rename.prepare_spoke_router_rename(
+        panorama, (_rename_inventory(),), (_plan(),), "Branch VR"
+    )
+    assert rename is not None
+    assert rename.mapping("001122") == {"default": "Branch VR"}
+    assert rename.mapping("998877") == {}
+    router_rename.apply_spoke_router_rename(panorama, rename)
+    assert xapi.rename.call_count == 3  # Two templates plus stack override.
+    assert (
+        _required(
+            root,
+            ".//template/entry[@name='spoke-base']"
+            "//entry[@name='Branch VR']/protocol/bgp/enable",
+        ).text
+        == "yes"
+    )
+    assert (
+        _required(root, ".//template/entry[@name='spoke-base']//next-vr").text
+        == "Branch VR"
+    )
+    imports = root.findall(
+        ".//template/entry[@name='spoke-template']//import/network/virtual-router/member"
+    )
+    assert [node.text for node in imports] == ["Branch VR", "other"]
+    assert (
+        ET.tostring(_required(root, ".//template/entry[@name='hub-template']"))
+        == hub_before
+    )
+    assert not xapi.commit.called
+
+
+def test_spoke_rename_matching_name_is_noop() -> None:
+    panorama, xapi = _panorama()
+    assert (
+        router_rename.prepare_spoke_router_rename(
+            panorama, (_rename_inventory(),), (_plan(),), "default"
+        )
+        is None
+    )
+    assert not xapi.get.called and not xapi.rename.called
+
+
+@pytest.mark.parametrize(
+    "failure", ["collision", "outsider", "hub-sharing", "missing", "assignment"]
+)
+def test_spoke_rename_rejects_unsafe_scope_before_writes(failure: str) -> None:
+    root = _rename_config()
+    if failure == "collision":
+        ET.SubElement(
+            _required(
+                root, ".//template/entry[@name='spoke-base']//network/virtual-router"
+            ),
+            "entry",
+            name="Branch VR",
+        )
+    elif failure == "outsider":
+        ET.SubElement(
+            _required(root, ".//template-stack/entry[@name='spoke-stack']/devices"),
+            "entry",
+            name="003344",
+        )
+    elif failure == "hub-sharing":
+        ET.SubElement(
+            _required(root, ".//template-stack/entry[@name='hub-stack']/templates"),
+            "member",
+        ).text = "spoke-base"
+    elif failure == "missing":
+        for parent in root.findall(".//network/virtual-router"):
+            for node in list(parent):
+                if node.get("name") == "default":
+                    parent.remove(node)
+    else:
+        _required(
+            root, ".//template-stack/entry[@name='spoke-stack']/templates/member"
+        ).text = "different-template"
+    panorama, xapi = _xml_xapi(root)
+    with pytest.raises(lsvpn.LsvpnConfigurationError):
+        router_rename.prepare_spoke_router_rename(
+            panorama, (_rename_inventory(),), (_plan(),), "Branch VR"
+        )
+    assert not xapi.rename.called and not xapi.edit.called
+
+
+def test_spoke_rename_includes_every_participating_shared_spoke() -> None:
+    root = _rename_config()
+    inventory = _rename_inventory()
+    ET.SubElement(
+        _required(root, ".//template-stack/entry[@name='spoke-stack']/devices"),
+        "entry",
+        name="003344",
+    )
+    panorama, xapi = _xml_xapi(root)
+    rename = router_rename.prepare_spoke_router_rename(
+        panorama,
+        (inventory, replace(inventory, serial="003344")),
+        (_plan(), replace(_plan(), spoke_identity="003344")),
+        "Branch VR",
+    )
+    assert rename is not None
+    assert rename.mapping("003344") == {"default": "Branch VR"}
+    router_rename.apply_spoke_router_rename(panorama, rename)
+    assert xapi.rename.call_count == 3
+
+
+def test_spoke_rename_detects_unrelated_drift() -> None:
+    root = _rename_config()
+    panorama, xapi = _xml_xapi(root)
+    rename = router_rename.prepare_spoke_router_rename(
+        panorama, (_rename_inventory(),), (_plan(),), "Branch VR"
+    )
+    original_edit = xapi.edit.side_effect
+
+    def edit(path: str, xml: str) -> None:
+        original_edit(path, xml)
+        _required(root, ".//template/entry[@name='hub-template']").set(
+            "unexpected", "change"
+        )
+
+    xapi.edit.side_effect = edit
+    assert rename is not None
+    with pytest.raises(lsvpn.LsvpnConfigurationError, match="verification failed"):
+        router_rename.apply_spoke_router_rename(panorama, rename)
+
+
+@pytest.mark.parametrize(
+    "invalid", ["", " ", "trailing ", "a" * 32, "bad/name", "bad'name"]
+)
+def test_spoke_router_name_validation(invalid: str) -> None:
+    with pytest.raises(lsvpn.LsvpnConfigurationError, match="1 to 31"):
+        router_rename.validate_router_name(invalid)
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_spoke_router_rename_runs_within_migration_rollback_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    fail: bool,
+) -> None:
+    panorama, xapi = _panorama()
+    xapi.get.return_value = ET.fromstring("<response><result/></response>")
+    plan = _plan()
+    replacement = lsvpn.build_standard_ipsec_objects(plan)
+    events: list[str] = []
+
+    def snapshot(*args: object, **kwargs: object) -> str:
+        events.append("snapshot")
+        return "LSVPN_PRE_test.xml"
+
+    monkeypatch.setattr(candidate, "save_pre_migration_snapshot", snapshot)
+    monkeypatch.setattr(
+        candidate,
+        "verify_candidate_configuration",
+        lambda *args: events.append("verify"),
+    )
+
+    def apply(*args: object) -> int:
+        events.append("rename")
+        if fail:
+            raise lsvpn.LsvpnConfigurationError("rename failed")
+        return 3
+
+    monkeypatch.setattr(candidate, "apply_spoke_router_rename", apply)
+    rollback = Mock()
+    monkeypatch.setattr(candidate, "rollback_candidate_configuration", rollback)
+    rename = router_rename.SpokeRouterRename("Branch VR", (("001122", "default"),), ())
+    arguments = (panorama, "branch", (plan,), (replacement,), (_placement(),))
+    if fail:
+        with pytest.raises(candidate.CandidateLoadError, match="rolled back"):
+            candidate.load_candidate_configuration(
+                *arguments,
+                allow_dirty_candidate=True,
+                source_configuration=(),
+                spoke_router_rename=rename,
+            )
+        rollback.assert_called_once()
+        assert replacement.spoke.routing_object.name == "default"
+    else:
+        result = candidate.load_candidate_configuration(
+            *arguments,
+            allow_dirty_candidate=True,
+            source_configuration=(),
+            spoke_router_rename=rename,
+        )
+        assert result.created_or_updated_objects == 17
+        assert replacement.spoke.routing_object.name == "Branch VR"
+        assert replacement.hub.routing_object.name == "default"
+        assert not rollback.called
+    assert events == ["snapshot", "verify", "rename"]
+    assert not xapi.commit.called
+
+
+@pytest.mark.parametrize("load_candidate", [False, True])
+def test_spoke_rename_preview_and_load_use_correct_sdk_names(
+    load_candidate: bool,
+) -> None:
+    from panos_tunnel_builder import cli
+
+    panorama, xapi = _xml_xapi(_rename_config())
+    plan = _plan()
+    replacement = lsvpn.build_standard_ipsec_objects(plan)
+    rename = cli._prepare_spoke_router_option(
+        panorama,
+        (_rename_inventory(),),
+        (plan,),
+        (replacement,),
+        "Branch VR",
+        load_candidate,
+    )
+    assert rename is not None
+    assert replacement.spoke.routing_object.name == (
+        "default" if load_candidate else "Branch VR"
+    )
+    assert replacement.hub.routing_object.name == "default"
+    assert plan.spoke_tunnel_source is not None
+    assert plan.spoke_tunnel_source.virtual_routers == ("default",)
+    assert not xapi.rename.called and not xapi.edit.called
+
+
+def test_spoke_rename_rejects_logical_router_and_multiple_source_routers() -> None:
+    plan = _plan()
+    source = plan.spoke_tunnel_source
+    assert source is not None
+    panorama, xapi = _panorama()
+    logical = replace(
+        plan,
+        spoke_tunnel_source=replace(
+            source,
+            routing_instances=(
+                lsvpn.RoutingInstanceConfig("logical-router", "MainLR", "default"),
+            ),
+        ),
+    )
+    with pytest.raises(
+        lsvpn.LsvpnConfigurationError, match="legacy virtual routers only"
+    ):
+        router_rename.prepare_spoke_router_rename(
+            panorama, (_rename_inventory(),), (logical,), "Branch VR"
+        )
+    other = replace(
+        plan,
+        spoke_tunnel_source=replace(
+            source,
+            routing_instances=(lsvpn.RoutingInstanceConfig("virtual-router", "other"),),
+        ),
+    )
+    with pytest.raises(lsvpn.LsvpnConfigurationError, match="Cannot merge"):
+        router_rename.prepare_spoke_router_rename(
+            panorama, (_rename_inventory(),), (plan, other), "Branch VR"
+        )
+    assert not xapi.get.called
+
+
+def test_spoke_rename_rejects_local_router_name_collision() -> None:
+    panorama, xapi = _xml_xapi(_rename_config())
+    xapi.show.return_value = ET.fromstring(
+        '<response status="success"><result><config><devices><entry>'
+        '<network><virtual-router><entry name="Branch VR"/></virtual-router>'
+        "</network></entry></devices></config></result></response>"
+    )
+    with pytest.raises(
+        lsvpn.LsvpnConfigurationError, match="already exists on firewall"
+    ):
+        router_rename.prepare_spoke_router_rename(
+            panorama, (_rename_inventory(),), (_plan(),), "Branch VR"
+        )
+    assert not xapi.rename.called
+
+
+@pytest.mark.parametrize("running", [False, True])
+@pytest.mark.parametrize("setting", ["definition", "reference"])
+def test_spoke_rename_blocks_local_settings_that_would_retain_old_name(
+    running: bool,
+    setting: str,
+) -> None:
+    panorama, xapi = _xml_xapi(_rename_config())
+    xml = (
+        '<network><virtual-router><entry name="default"/></virtual-router></network>'
+        if setting == "definition"
+        else '<vsys><entry name="vsys1"><import><network><virtual-router>'
+        "<member>default</member></virtual-router></network></import></entry></vsys>"
+    )
+    response = ET.fromstring(
+        '<response status="success"><result><config><devices><entry>'
+        + xml
+        + "</entry></devices></config></result></response>"
+    )
+    if running:
+        xapi.show.return_value = response
+    else:
+        original_get = xapi.get.side_effect
+
+        def get(path: str, **kwargs: object) -> ET.Element:
+            return response if "extra_qs" in kwargs else original_get(path, **kwargs)
+
+        xapi.get.side_effect = get
+    with pytest.raises(
+        lsvpn.LsvpnConfigurationError, match="local router configuration"
+    ):
+        router_rename.prepare_spoke_router_rename(
+            panorama, (_rename_inventory(),), (_plan(),), "Branch VR"
+        )
+    assert not xapi.rename.called and not xapi.edit.called
+
+
+def test_spoke_rename_blocks_duplicate_vsys_import_target() -> None:
+    root = _rename_config()
+    imports = _required(
+        root, ".//template/entry[@name='spoke-template']//import/network/virtual-router"
+    )
+    ET.SubElement(imports, "member").text = "Branch VR"
+    panorama, xapi = _xml_xapi(root)
+    with pytest.raises(lsvpn.LsvpnConfigurationError, match="already imported"):
+        router_rename.prepare_spoke_router_rename(
+            panorama, (_rename_inventory(),), (_plan(),), "Branch VR"
+        )
+    assert not xapi.rename.called
+
+
+def test_spoke_rename_name_matching_is_case_sensitive() -> None:
+    panorama, xapi = _xml_xapi(_rename_config())
+    rename = router_rename.prepare_spoke_router_rename(
+        panorama, (_rename_inventory(),), (_plan(),), "Default"
+    )
+    assert rename is not None
+    assert rename.mapping("001122") == {"default": "Default"}
+    router_rename.apply_spoke_router_rename(panorama, rename)
+    assert xapi.rename.call_count == 3

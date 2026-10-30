@@ -53,6 +53,7 @@ _CONFIGURATION_KEYS: dict[str, object] = {
         "hub_template_menu_number",
         "spoke_vsys",
         "hub_vsys",
+        "spoke_virtual_router_name",
         "show_secrets",
         "tunnel_address_pool",
         "load_candidate",
@@ -62,7 +63,14 @@ _CONFIGURATION_KEYS: dict[str, object] = {
     },
     "routes": {
         "snapshot": {"firewall", "output_file", "vsys", "overwrite_existing_file"},
-        "compare": {"before", "after", "prefix_map", "interface_map", "next_hop_map"},
+        "compare": {
+            "before",
+            "after",
+            "prefix_map",
+            "interface_map",
+            "next_hop_map",
+            "virtual_router_map",
+        },
         "verify-migration": {"manifest_file", "output_directory"},
     },
     "candidate": {"restore": {"snapshot_name", "skip_confirmation"}},
@@ -107,6 +115,13 @@ def configure_from_file(path: Path | None) -> dict[str, Any]:
             f'Unable to load configuration file "{path}": {exc}'
         ) from exc
     _validate_keys(values, _CONFIGURATION_KEYS, "configuration")
+    build_defaults = values.get("build", {})
+    if "spoke_virtual_router_name" in build_defaults and not isinstance(
+        build_defaults["spoke_virtual_router_name"], str
+    ):
+        raise ConfigurationFileError(
+            "build.spoke_virtual_router_name must be a string."
+        )
     panorama = values.pop("panorama", {})
     assert isinstance(panorama, dict)
     for key in ("host", "api_key", "ca_bundle"):

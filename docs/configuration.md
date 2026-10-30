@@ -65,6 +65,8 @@ and malformed TOML are rejected.
 | `build` | `spoke_template_name`, `hub_template_name` | Exact, case-sensitive names in each assigned stack. |
 | `build` | `spoke_template_menu_number`, `hub_template_menu_number` | Alternative 1-based menu positions; 0 cancels. |
 | `build` | `spoke_vsys`, `hub_vsys` | Virtual systems for the two endpoints. |
+| `build` | `spoke_virtual_router_name` | Optional target name for each migrated spoke's legacy virtual router; the hub keeps its name. |
+| `routes.compare` | `virtual_router_map` | Expected router renames as an array of `OLD=NEW` strings. |
 | `build` | `allow_pending_candidate_changes` | Permit loading over pending Panorama changes; failure rollback discards all pending changes. |
 | `build` | `migration_artifact_directory` | Local baseline snapshot and validation-manifest directory. |
 | `routes.snapshot` | `output_file`, `overwrite_existing_file` | Local snapshot filename and permission to replace it. |

@@ -20,6 +20,7 @@ from .candidate import (
     CandidateRestoreError,
     CandidateVariableSet,
     ReplacementTemplatePlacement,
+    SourceConfigurationFingerprint,
     capture_source_configuration,
     discover_lsvpn_satellite_template_owner,
     discover_replacement_template_placements,
@@ -78,6 +79,11 @@ from .route_validation import (
     compare_routing_configurations,
     find_static_route_names,
     parse_mapping,
+)
+from .router_rename import (
+    SpokeRouterRename,
+    prepare_spoke_router_rename,
+    validate_router_name,
 )
 from .shared_migration import (
     SharedSpokeReplacement,
@@ -300,6 +306,13 @@ def routes_compare(
             help="Expected next-hop replacement as OLD=NEW; repeat as needed.",
         ),
     ] = None,
+    virtual_router_map: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--virtual-router-map",
+            help="Expected virtual-router rename as OLD=NEW; repeat as needed.",
+        ),
+    ] = None,
 ) -> None:
     """Compare two snapshots and fail when stable RIB state differs."""
     try:
@@ -311,6 +324,7 @@ def routes_compare(
             prefix_map=parse_mapping(prefix_map, "prefix"),
             interface_map=parse_mapping(interface_map, "interface"),
             next_hop_map=parse_mapping(next_hop_map, "next-hop"),
+            virtual_router_map=parse_mapping(virtual_router_map, "virtual-router"),
         )
         _show_route_comparison(comparison)
         if not comparison.equivalent:
@@ -539,6 +553,7 @@ def _build_group_migration_manifest(
     hub_vsys: str,
     baselines: dict[tuple[str, str], tuple[Path, RouteSnapshot]],
     plans: tuple[StandardIpsecClonePlan, ...],
+    spoke_router_rename: SpokeRouterRename | None = None,
 ) -> MigrationValidationManifest:
     endpoints: list[MigrationEndpointValidation] = []
     for spoke in spokes:
@@ -552,8 +567,23 @@ def _build_group_migration_manifest(
         mutable_interfaces, mutable_route_names = _migration_routing_config_scope(
             "spoke", spoke_plans, baseline
         )
+        router_map = (
+            spoke_router_rename.mapping(spoke.serial) if spoke_router_rename else {}
+        )
+        captured = {
+            item.name
+            for item in baseline.captured_routing_instances
+            if item.kind == "virtual-router"
+        }
+        if any(
+            old not in captured or new in captured for old, new in router_map.items()
+        ):
+            raise RouteValidationError(
+                "Router rename conflicts with the spoke baseline routing instances."
+            )
         endpoints.append(
             MigrationEndpointValidation(
+                virtual_router_map=router_map,
                 role="spoke",
                 firewall_name=spoke.firewall_name,
                 serial=spoke.serial,
@@ -648,12 +678,14 @@ def routes_verify_migration(
                 path_mappings=endpoint.path_mappings,
                 allowed_added_prefixes=endpoint.allowed_added_prefixes,
                 allow_additional_candidates=True,
+                virtual_router_map=endpoint.virtual_router_map,
             )
             routing_config_changes = compare_routing_configurations(
                 baseline,
                 after,
                 mutable_interfaces=endpoint.mutable_routing_interfaces,
                 mutable_route_names=endpoint.mutable_route_names,
+                virtual_router_map=endpoint.virtual_router_map,
             )
             typer.echo(
                 f'{endpoint.role.capitalize()} firewall "{endpoint.firewall_name}":'
@@ -1459,6 +1491,154 @@ def _finish_candidate_load(
         )
 
 
+def _load_shared_candidate(
+    panorama: Panorama,
+    inventory: FirewallTemplateInventory,
+    spoke_template_name: str,
+    hub_inventory: FirewallTemplateInventory,
+    spoke_inventories: tuple[FirewallTemplateInventory, ...],
+    shared_build: SharedBuildResult,
+    vsys: str,
+    hub_vsys: str,
+    yes: bool,
+    allow_dirty_candidate: bool,
+    snapshot_directory: Path,
+    source_configuration: tuple[SourceConfigurationFingerprint, ...],
+    spoke_router_rename: SpokeRouterRename | None,
+) -> None:
+    clone_plans = shared_build.plans
+    replacements = shared_build.replacements
+    if not clone_plans:
+        _heading("Candidate load result")
+        typer.echo("  Status: no LSVPN satellite configuration remains")
+        typer.echo("  Changes: none")
+        typer.echo("  Commit/push: not issued")
+        return
+    if len(replacements) != len(clone_plans):
+        raise LsvpnConfigurationError(
+            "A complete replacement plan is required before candidate "
+            "configuration can be loaded."
+        )
+    if allow_dirty_candidate:
+        typer.echo(
+            "WARNING: dirty-candidate protection is disabled. A loading "
+            "error will revert every pending Panorama candidate change."
+        )
+    if not yes:
+        typer.confirm(
+            "Load candidate configuration now? This removes the spoke "
+            "LSVPN satellite object and its old tunnel bindings from the "
+            "Panorama candidate configuration. No commit or push is issued.",
+            abort=True,
+        )
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    create_artifact_directory(snapshot_directory)
+    baselines: dict[tuple[str, str], tuple[Path, RouteSnapshot]] = {}
+    with _migration_route_artifacts() as route_snapshot_paths:
+        endpoints = (
+            *(("spoke", item, vsys) for item in spoke_inventories),
+            ("hub", hub_inventory, hub_vsys),
+        )
+        for role, endpoint_inventory, endpoint_vsys in endpoints:
+            safe_name = re.sub(
+                r"[^A-Za-z0-9_.-]", "-", endpoint_inventory.firewall_name
+            )
+            route_path = snapshot_directory / (
+                f"LSVPN_PRE_MIGRATION_{role}_{safe_name}_{timestamp}_routes.json"
+            )
+            route_snapshot = capture_route_snapshot(
+                panorama,
+                endpoint_inventory.firewall_name,
+                endpoint_inventory.serial,
+                endpoint_vsys,
+            )
+            write_private_artifact(route_path, route_snapshot.to_json())
+            route_snapshot_paths.append(route_path)
+            baselines[(role, endpoint_inventory.serial)] = (
+                route_path,
+                route_snapshot,
+            )
+
+        placement_list: list[ReplacementTemplatePlacement] = []
+        for item in shared_build.spokes:
+            placement_list.extend(
+                discover_replacement_template_placements(
+                    panorama,
+                    tuple(template.name for template in item.inventory.templates),
+                    tuple(template.name for template in hub_inventory.templates),
+                    (item.plan,),
+                    vsys,
+                    hub_vsys,
+                )
+            )
+        placements = tuple(placement_list)
+        try:
+            manifest = _build_group_migration_manifest(
+                "",
+                spoke_inventories,
+                hub_inventory,
+                vsys,
+                hub_vsys,
+                baselines,
+                tuple(clone_plans),
+                spoke_router_rename,
+            )
+            # Catch construction/serialization errors before any remote writes.
+            manifest.to_json()
+        except Exception as exc:
+            raise LsvpnConfigurationError(
+                f"Cannot prepare validation manifest: {exc}. "
+                "Candidate loading was not attempted."
+            ) from exc
+        candidate_result = load_candidate_configuration(
+            panorama,
+            spoke_template_name,
+            tuple(clone_plans),
+            tuple(replacements),
+            placements,
+            vsys,
+            hub_vsys,
+            shared_build.variables,
+            allow_dirty_candidate,
+            on_snapshot_saved=lambda name: typer.echo(
+                f'  Recovery snapshot saved on Panorama: "{name}"'
+            ),
+            source_configuration=tuple(source_configuration),
+            spoke_router_rename=spoke_router_rename,
+        )
+    spoke_safe_name = re.sub(r"[^A-Za-z0-9_.-]", "-", inventory.firewall_name)
+    manifest_path = snapshot_directory / (
+        f"LSVPN_MIGRATION_{spoke_safe_name}_{timestamp}_validation.json"
+    )
+    _finish_candidate_load(
+        candidate_result, manifest, manifest_path, route_snapshot_paths
+    )
+
+
+def _prepare_spoke_router_option(
+    panorama: Panorama,
+    spokes: tuple[FirewallTemplateInventory, ...],
+    plans: tuple[StandardIpsecClonePlan, ...],
+    replacements: tuple[StandardIpsecReplacementObjects, ...],
+    new_name: str | None,
+    load_candidate: bool,
+) -> SpokeRouterRename | None:
+    if new_name is None or not plans:
+        return None
+    rename = prepare_spoke_router_rename(panorama, spokes, plans, new_name)
+    _heading("Spoke virtual router")
+    if rename is None:
+        typer.echo(f'  Already named "{new_name}"; no rename required.')
+        return None
+    for serial, old in rename.routers_by_serial:
+        if old != new_name:
+            typer.echo(f'  {serial}: "{old}" → "{new_name}"')
+    if not load_candidate:
+        for replacement in replacements:
+            replacement.spoke.routing_object.name = new_name
+    return rename
+
+
 @app.command()
 def build(
     ctx: typer.Context,
@@ -1523,6 +1703,16 @@ def build(
             help="Hub virtual system containing the portal and gateway.",
         ),
     ] = DEFAULT_VSYS,
+    spoke_virtual_router_name: Annotated[
+        str | None,
+        typer.Option(
+            "--spoke-virtual-router-name",
+            help=(
+                "Rename the existing spoke virtual router during migration; "
+                "names are case-sensitive."
+            ),
+        ),
+    ] = None,
     show_secrets: Annotated[
         bool,
         typer.Option(
@@ -1600,6 +1790,8 @@ def build(
         "hub_template_number",
     )
     try:
+        if spoke_virtual_router_name is not None:
+            validate_router_name(spoke_virtual_router_name)
         firewall_name = firewall or typer.prompt(
             "Spoke firewall hostname or serial number"
         )
@@ -1708,6 +1900,14 @@ def build(
         )
         clone_plans = list(shared_build.plans)
         replacements = list(shared_build.replacements)
+        spoke_router_rename = _prepare_spoke_router_option(
+            panorama,
+            spoke_inventories,
+            tuple(clone_plans),
+            tuple(replacements),
+            spoke_virtual_router_name,
+            load_candidate,
+        )
         if replacements:
             if not load_candidate:
                 stage_standard_ipsec_objects(
@@ -1734,112 +1934,20 @@ def build(
             )
 
         if load_candidate:
-            if not clone_plans:
-                _heading("Candidate load result")
-                typer.echo("  Status: no LSVPN satellite configuration remains")
-                typer.echo("  Changes: none")
-                typer.echo("  Commit/push: not issued")
-                return
-            if len(replacements) != len(clone_plans):
-                raise LsvpnConfigurationError(
-                    "A complete replacement plan is required before candidate "
-                    "configuration can be loaded."
-                )
-            if allow_dirty_candidate:
-                typer.echo(
-                    "WARNING: dirty-candidate protection is disabled. A loading "
-                    "error will revert every pending Panorama candidate change."
-                )
-            if not yes:
-                typer.confirm(
-                    "Load candidate configuration now? This removes the spoke "
-                    "LSVPN satellite object and its old tunnel bindings from the "
-                    "Panorama candidate configuration. No commit or push is issued.",
-                    abort=True,
-                )
-            timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-            create_artifact_directory(snapshot_directory)
-            baselines: dict[tuple[str, str], tuple[Path, RouteSnapshot]] = {}
-            with _migration_route_artifacts() as route_snapshot_paths:
-                endpoints = (
-                    *(("spoke", item, vsys) for item in spoke_inventories),
-                    ("hub", hub_inventory, hub_vsys),
-                )
-                for role, endpoint_inventory, endpoint_vsys in endpoints:
-                    safe_name = re.sub(
-                        r"[^A-Za-z0-9_.-]", "-", endpoint_inventory.firewall_name
-                    )
-                    route_path = snapshot_directory / (
-                        f"LSVPN_PRE_MIGRATION_{role}_{safe_name}_{timestamp}_routes.json"
-                    )
-                    route_snapshot = capture_route_snapshot(
-                        panorama,
-                        endpoint_inventory.firewall_name,
-                        endpoint_inventory.serial,
-                        endpoint_vsys,
-                    )
-                    write_private_artifact(route_path, route_snapshot.to_json())
-                    route_snapshot_paths.append(route_path)
-                    baselines[(role, endpoint_inventory.serial)] = (
-                        route_path,
-                        route_snapshot,
-                    )
-
-                placement_list: list[ReplacementTemplatePlacement] = []
-                for item in shared_build.spokes:
-                    placement_list.extend(
-                        discover_replacement_template_placements(
-                            panorama,
-                            tuple(
-                                template.name for template in item.inventory.templates
-                            ),
-                            tuple(
-                                template.name for template in hub_inventory.templates
-                            ),
-                            (item.plan,),
-                            vsys,
-                            hub_vsys,
-                        )
-                    )
-                placements = tuple(placement_list)
-                try:
-                    manifest = _build_group_migration_manifest(
-                        "",
-                        spoke_inventories,
-                        hub_inventory,
-                        vsys,
-                        hub_vsys,
-                        baselines,
-                        tuple(clone_plans),
-                    )
-                    # Catch construction/serialization errors before any remote writes.
-                    manifest.to_json()
-                except Exception as exc:
-                    raise LsvpnConfigurationError(
-                        f"Cannot prepare validation manifest: {exc}. "
-                        "Candidate loading was not attempted."
-                    ) from exc
-                candidate_result = load_candidate_configuration(
-                    panorama,
-                    selected.name,
-                    tuple(clone_plans),
-                    tuple(replacements),
-                    placements,
-                    vsys,
-                    hub_vsys,
-                    shared_build.variables,
-                    allow_dirty_candidate,
-                    on_snapshot_saved=lambda name: typer.echo(
-                        f'  Recovery snapshot saved on Panorama: "{name}"'
-                    ),
-                    source_configuration=tuple(source_configuration),
-                )
-            spoke_safe_name = re.sub(r"[^A-Za-z0-9_.-]", "-", inventory.firewall_name)
-            manifest_path = snapshot_directory / (
-                f"LSVPN_MIGRATION_{spoke_safe_name}_{timestamp}_validation.json"
-            )
-            _finish_candidate_load(
-                candidate_result, manifest, manifest_path, route_snapshot_paths
+            _load_shared_candidate(
+                panorama,
+                inventory,
+                selected.name,
+                hub_inventory,
+                spoke_inventories,
+                shared_build,
+                vsys,
+                hub_vsys,
+                yes,
+                allow_dirty_candidate,
+                snapshot_directory,
+                tuple(source_configuration),
+                spoke_router_rename,
             )
 
     except typer.Abort:
