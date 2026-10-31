@@ -2196,3 +2196,77 @@ def test_management_profile_preview_assigns_only_spoke_tunnels() -> None:
     assert replacement.spoke.tunnel_interface.management_profile == "ping-only"
     assert replacement.hub.tunnel_interface.management_profile is None
     assert not xapi.set.called and not xapi.rename.called
+
+
+def test_router_rename_cannot_change_unrelated_router_on_already_named_spoke() -> None:
+    root = _rename_config()
+    device = _required(root, "./devices/entry")
+    templates = _required(device, "./template")
+    second = ET.SubElement(templates, "entry", name="second-spoke")
+    second.append(
+        ET.fromstring(
+            '<config><devices><entry name="localhost.localdomain"><network>'
+            '<virtual-router><entry name="Branch VR"><interface>'
+            "<member>tunnel.2</member>"
+            "</interface></entry></virtual-router></network></entry></devices></config>"
+        )
+    )
+    stacks = _required(device, "./template-stack")
+    stacks.append(
+        ET.fromstring(
+            '<entry name="second-stack"><templates><member>spoke-base</member>'
+            '<member>second-spoke</member></templates><devices><entry name="003344"/>'
+            "</devices></entry>"
+        )
+    )
+    second_inventory = FirewallTemplateInventory(
+        "branch-02",
+        "003344",
+        "second-stack",
+        (
+            TemplateCandidate("spoke-base", ()),
+            TemplateCandidate("second-spoke", ("tunnel.2",)),
+        ),
+    )
+    first_plan = _plan()
+    source = first_plan.spoke_tunnel_source
+    assert source is not None
+    second_plan = replace(
+        first_plan,
+        spoke_identity="003344",
+        spoke_tunnel_source=replace(
+            source,
+            virtual_routers=("Branch VR",),
+            routing_instances=(
+                lsvpn.RoutingInstanceConfig("virtual-router", "Branch VR"),
+            ),
+        ),
+    )
+    panorama, xapi = _xml_xapi(root)
+    with pytest.raises(lsvpn.LsvpnConfigurationError, match="different source router"):
+        router_rename.prepare_spoke_router_rename(
+            panorama,
+            (_rename_inventory(), second_inventory),
+            (first_plan, second_plan),
+            "Branch VR",
+        )
+    assert not xapi.rename.called
+
+
+def test_router_rename_accepts_schema_field_reordering() -> None:
+    root = _rename_config()
+    panorama, xapi = _xml_xapi(root)
+    original_rename = xapi.rename.side_effect
+
+    def rename(path: str, name: str) -> None:
+        original_rename(path, name)
+        for node in root.iter():
+            if len({child.tag for child in node}) == len(node):
+                node[:] = sorted(node, key=lambda child: child.tag)
+
+    xapi.rename.side_effect = rename
+    plan = router_rename.prepare_spoke_router_rename(
+        panorama, (_rename_inventory(),), (_plan(),), "Branch VR"
+    )
+    assert plan is not None
+    router_rename.apply_spoke_router_rename(panorama, plan)

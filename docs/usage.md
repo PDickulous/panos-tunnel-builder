@@ -50,7 +50,9 @@ inheriting a changed template must belong to the spoke migration group; isolate
 other consumers before renaming. Local firewall router settings or references
 that retain the old name must first be moved into Panorama templates; both local
 candidate and running configuration are checked. Existing target names, multiple
-source routers on one spoke, and logical-router/VRF renames are rejected. A matching name needs
+source routers on one spoke, and logical-router/VRF renames are rejected.
+Spokes with different source router names must not share routing declarations or
+references affected by the rename, including spokes already using the target name. A matching name needs
 no rename. If no LSVPN satellite remains, a load request completes as a no-op;
 greenfield tunnels and standalone router renames are not created.
 

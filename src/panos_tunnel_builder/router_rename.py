@@ -55,8 +55,10 @@ def _config(
     operation = panorama.xapi.show if running else panorama.xapi.get
     options = {"extra_qs": {"target": serial}} if serial else {}
     response = operation("/config", **options)
-    if not isinstance(response, ET.Element) or (
-        response.tag == "response" and response.get("status") != "success"
+    if (
+        not isinstance(response, ET.Element)
+        or response.tag not in {"config", "response"}
+        or (response.tag == "response" and response.get("status") != "success")
     ):
         raise LsvpnConfigurationError(
             f"Cannot verify full configuration for {purpose}."
@@ -64,6 +66,17 @@ def _config(
     root = response if response.tag == "config" else response.find("./result/config")
     if root is None or not len(root):
         raise LsvpnConfigurationError(f"Full configuration is required for {purpose}.")
+    if serial is not None:
+        devices = root.findall("./devices/entry")
+        if (
+            len(devices) != 1
+            or root.find("./devices/entry/template") is not None
+            or root.find("./devices/entry/template-stack") is not None
+        ):
+            raise LsvpnConfigurationError(
+                f"Cannot verify local firewall configuration for {purpose}: "
+                "expected one firewall device entry, not partial or Panorama data."
+            )
     return deepcopy(root)
 
 
@@ -72,6 +85,11 @@ def _canonical(root: ET.Element) -> str:
     for node in copied.iter():
         for attribute in _METADATA:
             node.attrib.pop(attribute, None)
+    # Scalar configuration fields are identified by tag, not sibling position.
+    # Preserve repeated-tag lists (especially policy rules and template priority).
+    for parent in copied.iter():
+        if len({child.tag for child in parent}) == len(parent):
+            parent[:] = sorted(parent, key=lambda child: child.tag)
     # Router, management-profile, and import order have no policy-order semantics.
     # Native rename can move entries; retain ordering elsewhere, including rules.
     unordered = copied.findall(".//network/virtual-router")
@@ -187,6 +205,7 @@ def prepare_spoke_router_rename(
     }
     selected = set(names)
     scopes: dict[str, RouterRenameScope] = {}
+    scope_paths: dict[str, set[str]] = {}
     for spoke in spokes:
         old = dict(by_serial)[spoke.serial]
         if old != new_name:
@@ -236,6 +255,7 @@ def prepare_spoke_router_rename(
                 raise LsvpnConfigurationError(f'Cannot find spoke template "{name}".')
             entries.append((f"{device_path}/template/{_segment(template)}", template))
         entries.append((f"{device_path}/template-stack/{_segment(stack)}", stack))
+        scope_paths[spoke.serial] = {f"{path}/config" for path, _ in entries}
         found = False
         for path, entry in entries:
             config = entry.find("./config")
@@ -288,6 +308,14 @@ def prepare_spoke_router_rename(
             raise LsvpnConfigurationError(
                 f'Spoke router "{old}" is not owned by its Panorama templates.'
             )
+    for serial, source_name in by_serial:
+        for scope in scopes.values():
+            if scope.xpath in scope_paths[serial] and scope.old_name != source_name:
+                raise LsvpnConfigurationError(
+                    f'Firewall "{serial}" has a different source router; '
+                    f'renaming shared router "{scope.old_name}" would change '
+                    "an unrelated routing instance. Isolate the templates first."
+                )
     return SpokeRouterRename(new_name, by_serial, tuple(scopes.values()))
 
 

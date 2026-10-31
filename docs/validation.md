@@ -276,3 +276,9 @@ checks, local conflicts, and unexpected candidate drift. Profile operations are
 verified inside the same recovery-snapshot and rollback boundary as the tunnel
 migration; interruptions and post-write failures trigger rollback. Hub definitions
 and assignments are preserved. Live Panorama validation has not been performed.
+
+Review regressions also cover mixed source-router names across shared spoke
+templates, canonical profile conflicts on later stacks before any simulation,
+and partial or mistargeted local-configuration responses. Candidate comparison
+accepts reordering of distinct scalar fields while retaining policy-rule order
+and template priority checks.

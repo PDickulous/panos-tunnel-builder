@@ -478,3 +478,109 @@ def test_upper_source_restriction_cannot_be_masked_by_lower_allow_all_list() -> 
     assert not plan.renames and len(plan.creations) == 1
     profiles.apply_ping_only_profiles(memory.panorama, plan)
     assert not memory.xapi.rename.called
+
+
+def _second_stack_with_conflicting_target(
+    root: ET.Element,
+) -> FirewallTemplateInventory:
+    _required(root, ".//template/entry[@name='base']//entry[@name='Old Ping']").append(
+        ET.fromstring("<https>no</https>")
+    )
+    _required(root, "./devices/entry/template").append(
+        ET.fromstring(
+            '<entry name="second"><config><devices><entry name="localhost.localdomain">'
+            '<network><profiles><interface-management-profile><entry name="ping-only">'
+            "<ping>yes</ping><https>yes</https></entry></interface-management-profile>"
+            "</profiles></network></entry></devices></config></entry>"
+        )
+    )
+    _required(root, "./devices/entry/template-stack").append(
+        ET.fromstring(
+            '<entry name="second-stack"><templates><member>base</member>'
+            "<member>branch</member><member>second</member></templates>"
+            '<devices><entry name="002"/></devices></entry>'
+        )
+    )
+    return FirewallTemplateInventory(
+        "branch-02",
+        "002",
+        "second-stack",
+        (
+            TemplateCandidate("base", ()),
+            TemplateCandidate("branch", ("tunnel.2",)),
+            TemplateCandidate("second", ()),
+        ),
+    )
+
+
+@pytest.mark.parametrize("operation", ["rename", "create"])
+def test_earlier_stack_change_cannot_hide_existing_target_conflict(
+    operation: str,
+) -> None:
+    enabled = "yes" if operation == "rename" else "no"
+    root = _config(f'<entry name="Old Ping"><ping>{enabled}</ping></entry>')
+    second = _second_stack_with_conflicting_target(root)
+    memory = MemoryConfig(root)
+    with pytest.raises(LsvpnConfigurationError, match="different permissions"):
+        profiles.prepare_ping_only_profiles(
+            memory.panorama, (_inventory(), second), "branch"
+        )
+    assert not memory.xapi.rename.called and not memory.xapi.set.called
+
+
+def test_profile_creation_accepts_schema_field_reordering() -> None:
+    memory = MemoryConfig(_config())
+    original_set = memory.xapi.set.side_effect
+
+    def set_profile(path: str, xml: str) -> None:
+        original_set(path, xml)
+        for node in memory.root.iter():
+            if len({child.tag for child in node}) == len(node):
+                node[:] = sorted(node, key=lambda child: child.tag)
+
+    memory.xapi.set.side_effect = set_profile
+    plan = _prepare(memory)
+    profiles.apply_ping_only_profiles(memory.panorama, plan)
+
+
+@pytest.mark.parametrize("running", [False, True])
+@pytest.mark.parametrize("shape", ["partial", "panorama"])
+def test_local_profile_checks_require_a_full_firewall_response(
+    running: bool,
+    shape: str,
+) -> None:
+    memory = MemoryConfig(_config())
+    invalid = (
+        ET.fromstring(
+            "<config><shared><description>partial</description></shared></config>"
+        )
+        if shape == "partial"
+        else deepcopy(memory.root)
+    )
+    if running:
+        memory.local_running = invalid
+    else:
+        memory.local_candidate = invalid
+    with pytest.raises(LsvpnConfigurationError, match="local firewall configuration"):
+        _prepare(memory)
+    assert not memory.xapi.rename.called and not memory.xapi.set.called
+
+
+def test_profile_verification_still_rejects_policy_rule_reordering() -> None:
+    root = _config()
+    device = _required(root, ".//template/entry[@name='branch']/config/devices/entry")
+    rulebase = ET.SubElement(device, "rulebase")
+    rules = ET.SubElement(ET.SubElement(rulebase, "security"), "rules")
+    ET.SubElement(rules, "entry", name="allow-ping")
+    ET.SubElement(rules, "entry", name="deny-all")
+    memory = MemoryConfig(root)
+    original_set = memory.xapi.set.side_effect
+
+    def set_profile(path: str, xml: str) -> None:
+        original_set(path, xml)
+        rules[:] = list(reversed(rules))
+
+    memory.xapi.set.side_effect = set_profile
+    plan = _prepare(memory)
+    with pytest.raises(LsvpnConfigurationError, match="unexpected candidate changes"):
+        profiles.apply_ping_only_profiles(memory.panorama, plan)

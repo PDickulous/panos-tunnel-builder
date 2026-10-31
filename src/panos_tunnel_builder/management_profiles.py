@@ -350,6 +350,15 @@ def prepare_ping_only_profiles(
                         f'Firewall "{spoke.serial}" has a conflicting '
                         "local ping-only profile."
                     )
+    # Check every original stack before simulating any rename or creation. A new
+    # higher-priority definition must never mask a conflicting existing target.
+    for stack_name in stacks:
+        target = _profiles(_scopes(root, stack_name)).get(PING_ONLY)
+        if target is not None and not is_unrestricted_ping_only(target):
+            raise LsvpnConfigurationError(
+                f'Stack "{stack_name}" already has a ping-only '
+                "profile with different permissions."
+            )
     renames: dict[str, ProfileScopeRename] = {}
     creations: list[str] = []
     for stack_name in stacks:
